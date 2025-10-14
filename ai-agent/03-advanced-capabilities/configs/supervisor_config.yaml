@@ -1,0 +1,9 @@
+architecture: supervisor_with_specialists
+config_version_name: multi_agent_supervisor
+llm_endpoint_name: databricks-claude-3-7-sonnet
+routing_strategy: llm_based_classification
+specialist_agents:
+- billing
+- technical
+- retention
+
