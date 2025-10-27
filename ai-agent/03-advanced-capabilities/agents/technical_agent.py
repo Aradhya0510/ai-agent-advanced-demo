@@ -16,7 +16,10 @@ class TechnicalAgent(LangGraphResponsesAgent):
     """Specialized agent for technical support and troubleshooting"""
     
     def __init__(self, catalog: str, schema: str):
-        # Construct config path
+        # Load technical-specific configuration directly with yaml
+        # (Don't use ModelConfig here as it conflicts with supervisor's model_config)
+        import yaml
+        
         config_path = os.path.join(
             os.path.dirname(__file__), 
             '..', 
@@ -24,12 +27,11 @@ class TechnicalAgent(LangGraphResponsesAgent):
             'technical_agent_config.yaml'
         )
         
-        # Load technical-specific configuration
         try:
-            config = ModelConfig(development_config=config_path)
+            with open(config_path, 'r') as f:
+                config_dict = yaml.safe_load(f)
         except:
             # Fallback to default config if file not found
-            import yaml
             config_dict = {
                 "uc_tool_names": [
                     f"{catalog}.{schema}.web_search_simulation",
@@ -46,9 +48,11 @@ class TechnicalAgent(LangGraphResponsesAgent):
                 },
                 "max_history_messages": 20
             }
-            config = type('obj', (object,), {
-                'get': lambda self, key: config_dict.get(key)
-            })()
+        
+        # Create simple config object
+        config = type('obj', (object,), {
+            'get': lambda self, key: config_dict.get(key)
+        })()
         
         super().__init__(
             uc_tool_names=config.get("uc_tool_names"),

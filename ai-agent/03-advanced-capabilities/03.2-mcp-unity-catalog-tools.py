@@ -44,7 +44,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Install Required Packages
-# MAGIC %pip install -U -qqqq databricks-agents mlflow>=3.1.0 databricks-sdk==0.55.0 unitycatalog-ai[databricks] langchain-community tavily-python requests
+# MAGIC %pip install -U -qqqq databricks-agents mlflow>=3.1.0 databricks-sdk==0.55.0 unitycatalog-ai[databricks] langchain-community tavily-python requests databricks-langchain
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -226,14 +226,14 @@
 # For this demo, we'll create a Python function that simulates web search
 # In production, you would integrate with Tavily API
 
-def web_search_simulation(query: str, max_results: int = 3) -> str:
+def web_search_simulation(query: str, max_results: int) -> str:
     """
     Simulates web search for demo purposes.
     In production, replace with actual Tavily API integration.
     
     Args:
         query: Search query string
-        max_results: Maximum number of results to return
+        max_results: Maximum number of results to return (typically 3)
         
     Returns:
         Formatted search results as string
@@ -352,10 +352,10 @@ displayHTML(f'<a href="/explore/data/functions/{catalog}/{dbName}/web_search_sim
 # DBTITLE 1,List All UC Functions in Our Schema
 # MAGIC %sql
 # MAGIC SELECT 
-# MAGIC   function_name,
+# MAGIC   routine_name as function_name,
 # MAGIC   comment,
 # MAGIC   CASE 
-# MAGIC     WHEN function_name IN ('get_weather_by_city', 'calculate_distance', 'web_search_simulation') 
+# MAGIC     WHEN routine_name IN ('get_weather_by_city', 'calculate_distance', 'web_search_simulation') 
 # MAGIC     THEN '🌐 MCP External API'
 # MAGIC     ELSE '🏢 Internal Data'
 # MAGIC   END as tool_type
@@ -363,7 +363,7 @@ displayHTML(f'<a href="/explore/data/functions/{catalog}/{dbName}/web_search_sim
 # MAGIC WHERE routine_catalog = current_catalog()
 # MAGIC   AND routine_schema = current_schema()
 # MAGIC   AND routine_type = 'FUNCTION'
-# MAGIC ORDER BY tool_type, function_name;
+# MAGIC ORDER BY tool_type, routine_name;
 
 # COMMAND ----------
 
@@ -496,7 +496,12 @@ print(f"{'='*70}\n")
 
 answer_1 = AGENT.predict({"input":[{"role": "user", "content": test_query_1}]})
 print(f"\n💡 Agent Response:")
-print(answer_1['output'][-1]['content'][-1]['text'])
+# Handle both dict and ResponsesAgentResponse object types
+if isinstance(answer_1, dict):
+    print(answer_1['output'][-1]['content'][-1]['text'])
+else:
+    # ResponsesAgentResponse object with mixed dict/object structure
+    print(answer_1.output[-1].content[-1]['text'] if hasattr(answer_1, 'output') else str(answer_1))
 
 # COMMAND ----------
 
@@ -518,7 +523,12 @@ print(f"{'='*70}\n")
 
 answer_2 = AGENT.predict({"input":[{"role": "user", "content": test_query_2}]})
 print(f"\n💡 Agent Response:")
-print(answer_2['output'][-1]['content'][-1]['text'])
+# Handle both dict and ResponsesAgentResponse object types
+if isinstance(answer_2, dict):
+    print(answer_2['output'][-1]['content'][-1]['text'])
+else:
+    # ResponsesAgentResponse object with mixed dict/object structure
+    print(answer_2.output[-1].content[-1]['text'] if hasattr(answer_2, 'output') else str(answer_2))
 
 # COMMAND ----------
 
@@ -536,7 +546,12 @@ print(f"{'='*70}\n")
 
 answer_3 = AGENT.predict({"input":[{"role": "user", "content": test_query_3}]})
 print(f"\n💡 Agent Response:")
-print(answer_3['output'][-1]['content'][-1]['text'])
+# Handle both dict and ResponsesAgentResponse object types
+if isinstance(answer_3, dict):
+    print(answer_3['output'][-1]['content'][-1]['text'])
+else:
+    # ResponsesAgentResponse object with mixed dict/object structure
+    print(answer_3.output[-1].content[-1]['text'] if hasattr(answer_3, 'output') else str(answer_3))
 
 # COMMAND ----------
 
@@ -596,62 +611,71 @@ display(mcp_eval_data)
 
 # COMMAND ----------
 
+# DBTITLE 1,Log MCP-Enhanced Model
+# Log the MCP-enhanced model (separate from evaluation to avoid Py4J errors)
+print("📦 Logging MCP-enhanced agent model...")
+with mlflow.start_run(run_name='log_mcp_enhanced_agent'):
+    logged_agent_info = mlflow.pyfunc.log_model(
+        name="agent",
+        python_model=agent_eval_path+"/agent.py",
+        model_config=conf_path,
+        input_example={"input": [{"role": "user", "content": "Test with MCP tools"}]},
+        resources=AGENT.get_resources(),
+        extra_pip_requirements=["databricks-connect"]
+    )
+
+print(f"✅ Model logged with run_id: {logged_agent_info.run_id}")
+
+# COMMAND ----------
+
 # DBTITLE 1,Run MCP Agent Evaluation
 from mlflow.genai.scorers import RelevanceToQuery, Safety, Guidelines
-
-# Custom guideline for MCP tool usage
-mcp_tool_usage_guideline = Guidelines(
-    guidelines="""
-    Response must demonstrate appropriate tool selection:
-    - Use weather tool when connectivity/network issues mentioned with location
-    - Use distance tool when asking about technician dispatch or travel estimates
-    - Use web search for troubleshooting, error codes, or latest solutions
-    - Use internal tools for customer data, billing, subscriptions
-    - Should NOT mention tool names in response
-    - Should NOT explain reasoning or steps taken
-    """,
-    name="mcp_tool_usage"
-)
-
-scorers = [
-    RelevanceToQuery(),
-    Safety(),
-    mcp_tool_usage_guideline
-]
-
-# Prepare evaluation data in correct format
-eval_questions = mcp_eval_data['question'].tolist()
-eval_dataset = pd.DataFrame({"question": eval_questions})
-
-# Prediction wrapper
 import pandas as pd
+
+# Prepare evaluation dataset using MLflow dataset API
+# MLflow expects 'inputs' column to contain dictionaries
+eval_questions = mcp_eval_data['question'].tolist()
+# Each input must be a dict - wrap questions in dict format
+mcp_eval_dataset_df = pd.DataFrame({"inputs": [{"question": q} for q in eval_questions]})
+
+# Create or get MLflow dataset (following pattern from 02.1_agent_evaluation.py)
+mcp_eval_table_mlflow = f"{catalog}.{dbName}.mcp_agent_eval_mlflow"
+
+# Drop existing table first to avoid schema conflicts
+spark.sql(f"DROP TABLE IF EXISTS {mcp_eval_table_mlflow}")
+print(f"Dropped existing table {mcp_eval_table_mlflow} (if it existed)")
+
+# Create new MLflow dataset
+try:
+    eval_dataset = mlflow.genai.datasets.create_dataset(mcp_eval_table_mlflow)
+    eval_dataset.merge_records(spark.createDataFrame(mcp_eval_dataset_df))
+    print(f"✅ Created evaluation dataset with {len(eval_questions)} records.")
+except Exception as e:
+    if 'already exists' in str(e).lower():
+        # If dataset metadata exists but table was dropped, get it
+        eval_dataset = mlflow.genai.datasets.get_dataset(mcp_eval_table_mlflow)
+        print(f"✅ Retrieved existing evaluation dataset.")
+    else:
+        raise e
+
+# Get scorers (reuse from setup)
+scorers = get_scorers()
+
+# Load the logged model and create a prediction function
+loaded_model = mlflow.pyfunc.load_model(f"runs:/{logged_agent_info.run_id}/agent")
+
 def predict_wrapper(question):
+    # Format for chat-style models (question parameter matches the dict key)
     model_input = pd.DataFrame({
         "input": [[{"role": "user", "content": question}]]
     })
     response = loaded_model.predict(model_input)
     return response['output'][-1]['content'][-1]['text']
 
-# Load the MCP-enhanced model
-logged_agent_info = mlflow.pyfunc.log_model(
-    name="agent",
-    python_model=agent_eval_path+"/agent.py",
-    model_config=conf_path,
-    input_example={"input": [{"role": "user", "content": "Test with MCP tools"}]},
-    resources=AGENT.get_resources(),
-    extra_pip_requirements=["databricks-connect"]
-)
-
-loaded_model = mlflow.pyfunc.load_model(f"runs:/{logged_agent_info.run_id}/agent")
-
 # Run evaluation
-print("🧪 Running evaluation with MCP tool usage scorer...")
+print("Running evaluation...")
 with mlflow.start_run(run_name='eval_mcp_enhanced_agent'):
-    results = mlflow.genai.evaluate(
-        data=eval_dataset,
-        predict_fn=predict_wrapper,
-        scorers=scorers
-    )
+    results = mlflow.genai.evaluate(data=eval_dataset, predict_fn=predict_wrapper, scorers=scorers)
 
 print("\n✅ Evaluation complete! Check MLflow experiment for detailed results.")
 
@@ -715,7 +739,7 @@ print("   ✅ Overall Quality: +23 points (65% → 88%)")
 # DBTITLE 1,Analyze Tool Usage from MLflow Traces
 # In production, you would query MLflow traces to get actual tool usage
 # For demo, we'll show the pattern
-
+import pandas as pd
 tool_usage_data = pd.DataFrame({
     'Tool': ['get_weather_by_city', 'calculate_distance', 'web_search_simulation', 
              'get_customer_by_email', 'billing_functions', 'product_docs_retriever'],
@@ -765,6 +789,27 @@ display(tool_usage_data)
 
 # DBTITLE 1,Register to Unity Catalog
 from mlflow import MlflowClient
+import sys
+import os
+
+# Import config variables if not already in scope
+try:
+    catalog
+except NameError:
+    # Add parent directory to path to import config
+    config_path = os.path.abspath(os.path.join(os.getcwd(), ".."))
+    if config_path not in sys.path:
+        sys.path.append(config_path)
+    
+    # Import from the config module
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("config", os.path.join(config_path, "config.py"))
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+    
+    catalog = config_module.catalog
+    dbName = config_module.dbName
+    MODEL_NAME = config_module.MODEL_NAME
 
 UC_MODEL_NAME = f"{catalog}.{dbName}.{MODEL_NAME}_mcp"
 

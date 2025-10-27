@@ -55,6 +55,7 @@ class SupervisorAgent(ResponsesAgent):
         
         print(f"✅ Supervisor initialized with {len(self.agents)} specialist agents")
     
+    @mlflow.trace(span_type=SpanType.CHAIN, name="route_query")
     def route_query(self, query: str) -> Literal["billing", "technical", "retention"]:
         """
         Classify query intent and route to appropriate specialist agent.
@@ -90,6 +91,11 @@ Respond with ONLY the category name: billing, technical, or retention"""
         if intent not in ["billing", "technical", "retention"]:
             intent = "billing"  # Safe default
         
+        # Log routing decision to trace
+        mlflow.update_current_trace(
+            tags={"routing_decision": intent}
+        )
+        
         return intent
     
     @mlflow.trace(span_type=SpanType.AGENT, name="supervisor_predict")
@@ -100,22 +106,28 @@ Respond with ONLY the category name: billing, technical, or retention"""
         # Extract query from request
         query = request.input[0].content if request.input else ""
         
-        # Route to appropriate agent
+        # Route to appropriate agent (traced separately)
         selected_agent_name = self.route_query(query)
         selected_agent = self.agents[selected_agent_name]
         
-        # Log routing decision
+        # Log routing decision to supervisor trace
         mlflow.update_current_trace(
-            attributes={
+            tags={
                 "supervisor.selected_agent": selected_agent_name,
-                "supervisor.query": query
+                "supervisor.query": query,
+                "supervisor.architecture": "multi_agent"
             }
         )
         
         print(f"🎯 Supervisor routing to: {selected_agent_name.upper()} Agent")
         
-        # Delegate to specialist agent
-        specialist_response = selected_agent.predict(request)
+        # Create a traced wrapper for specialist call to ensure it's captured
+        @mlflow.trace(span_type=SpanType.AGENT, name=f"specialist_{selected_agent_name}_call")
+        def call_specialist():
+            return selected_agent.predict(request)
+        
+        # Delegate to specialist agent (will be traced as child span)
+        specialist_response = call_specialist()
         
         # Add supervisor metadata to response
         if hasattr(specialist_response, 'custom_outputs'):
@@ -163,7 +175,8 @@ Respond with ONLY the category name: billing, technical, or retention"""
         
         return unique_resources
     
-    def predict_multi_agent(self, request: ResponsesAgentRequest) -> dict[str, Any]:
+    @mlflow.trace(span_type=SpanType.AGENT, name="supervisor_multi_agent_predict")
+    def predict_multi_agent(self, request) -> dict[str, Any]:
         """
         Advanced: Handle queries requiring multiple agents.
         
@@ -171,7 +184,11 @@ Respond with ONLY the category name: billing, technical, or retention"""
             → Query billing agent AND technical agent
             → Aggregate both responses
         """
-        query = request.input[0].content if request.input else ""
+        # Handle both dict and ResponsesAgentRequest inputs
+        if isinstance(request, dict):
+            query = request.get("input", [{}])[0].get("content", "")
+        else:
+            query = request.input[0].content if request.input else ""
         
         # Detect if multiple agents needed (simplified logic)
         needs_billing = any(kw in query.lower() for kw in ['bill', 'payment', 'charge', 'subscription'])
@@ -186,6 +203,15 @@ Respond with ONLY the category name: billing, technical, or retention"""
         if needs_retention:
             agents_needed.append("retention")
         
+        # Log multi-agent coordination to trace
+        mlflow.update_current_trace(
+            tags={
+                "supervisor.multi_agent": True,
+                "supervisor.agents_needed": ",".join(agents_needed),
+                "supervisor.num_agents": len(agents_needed)
+            }
+        )
+        
         # If multiple agents needed, coordinate them
         if len(agents_needed) > 1:
             print(f"🔀 Multi-agent query detected: {', '.join(agents_needed)}")
@@ -193,8 +219,22 @@ Respond with ONLY the category name: billing, technical, or retention"""
             responses = {}
             for agent_name in agents_needed:
                 agent = self.agents[agent_name]
-                response = agent.predict(request)
-                responses[agent_name] = response['output'][-1]['content'][-1]['text']
+                
+                # Create traced wrapper for each specialist call
+                @mlflow.trace(span_type=SpanType.AGENT, name=f"multi_agent_specialist_{agent_name}_call")
+                def call_agent(agent_instance, req):
+                    # Convert dict to ResponsesAgentRequest if needed
+                    if isinstance(req, dict):
+                        from mlflow.types.responses import ResponsesAgentRequest
+                        agent_request = ResponsesAgentRequest(
+                            input=req.get("input", [])
+                        )
+                        return agent_instance.predict(agent_request)
+                    else:
+                        return agent_instance.predict(req)
+                
+                response = call_agent(agent, request)
+                responses[agent_name] = response.output[-1].content[-1]['text']
             
             # Aggregate responses
             aggregated = "Based on multiple specialist consultations:\n\n"
@@ -214,5 +254,46 @@ Respond with ONLY the category name: billing, technical, or retention"""
             }
         else:
             # Single agent route
-            return self.predict(request)
+            if isinstance(request, dict):
+                from mlflow.types.responses import ResponsesAgentRequest
+                agent_request = ResponsesAgentRequest(
+                    input=request.get("input", [])
+                )
+                response = self.predict(agent_request)
+            else:
+                response = self.predict(request)
+            # Convert ResponsesAgentResponse to dict format
+            output_items = []
+            for item in response.output:
+                output_dict = item.model_dump()
+                output_items.append(output_dict)
+            return {
+                "output": output_items,
+                "multi_agent": False,
+                "agents_used": []
+            }
 
+
+# Load configuration values from YAML
+# This runs at module level so the agent is available when Model Serving imports it
+import yaml
+
+try:
+    with open('./configs/supervisor_config.yaml', 'r') as f:
+        supervisor_config = yaml.safe_load(f)
+except:
+    # Fallback for build job
+    supervisor_config = {}
+
+model_config = mlflow.models.ModelConfig(development_config='./configs/supervisor_config.yaml')
+
+# Instantiate supervisor agent
+# Note: For deployment, specialist agent configs must be in the configs/ directory
+SUPERVISOR = SupervisorAgent(
+    catalog=model_config.get("catalog"),
+    schema=model_config.get("schema"),
+    llm_endpoint=model_config.get("llm_endpoint_name")
+)
+
+# Register agent with MLflow for inference (Models-from-Code pattern)
+mlflow.models.set_model(SUPERVISOR)

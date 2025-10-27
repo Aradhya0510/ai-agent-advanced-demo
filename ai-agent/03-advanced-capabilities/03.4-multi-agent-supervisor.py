@@ -233,6 +233,30 @@ print(f"   • Retention Agent: {len(retention_config['uc_tool_names'])} tools")
 
 # COMMAND ----------
 
+# DBTITLE 1,Create Supervisor Configuration
+# Create supervisor configuration (needed before importing supervisor_agent.py)
+# This config will be loaded by supervisor_agent.py using mlflow.models.ModelConfig
+supervisor_config = {
+    "config_version_name": "multi_agent_supervisor",
+    "architecture": "supervisor_with_specialists",
+    "specialist_agents": ["billing", "technical", "retention"],
+    "catalog": catalog,  # From setup script - single source of truth
+    "schema": dbName,    # From setup script - single source of truth
+    "llm_endpoint_name": LLM_ENDPOINT_NAME,  # From setup script
+    "routing_strategy": "llm_based_classification"
+}
+
+supervisor_config_path = f"{configs_dir}/supervisor_config.yaml"
+try:
+    with open(supervisor_config_path, 'w') as f:
+        yaml.dump(supervisor_config, f)
+except:
+    print('pass to work on build job')
+
+print(f"✅ Supervisor configuration created: {supervisor_config_path}")
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Step 2: Create Specialized Agent Classes
 # MAGIC
@@ -240,388 +264,16 @@ print(f"   • Retention Agent: {len(retention_config['uc_tool_names'])} tools")
 
 # COMMAND ----------
 
-# DBTITLE 1,Create agents Directory
-agents_dir = "./agents"
-os.makedirs(agents_dir, exist_ok=True)
-
-# Create __init__.py
-with open(f"{agents_dir}/__init__.py", 'w') as f:
-    f.write("# Specialized agents for multi-agent system\n")
-
-print(f"✅ Created agents directory: {agents_dir}")
-
-# COMMAND ----------
-
-# DBTITLE 1,Implement Billing Agent
-billing_agent_code = '''"""
-Billing Agent - Specialized for billing, payments, and subscriptions
-"""
-import mlflow
-from agent import LangGraphResponsesAgent
-from mlflow.models import ModelConfig
-
-class BillingAgent(LangGraphResponsesAgent):
-    """Specialized agent for billing and subscription queries"""
-    
-    def __init__(self, catalog: str, schema: str):
-        # Load billing-specific configuration
-        config = ModelConfig(development_config="../configs/billing_agent_config.yaml")
-        
-        super().__init__(
-            uc_tool_names=config.get("uc_tool_names"),
-            llm_endpoint_name=config.get("llm_endpoint_name"),
-            system_prompt=config.get("system_prompt"),
-            retriever_config=config.get("retriever_config"),
-            max_history_messages=config.get("max_history_messages")
-        )
-        
-        self.agent_name = "Billing Agent"
-        self.specialization = "billing_and_subscriptions"
-    
-    def get_capabilities(self) -> list[str]:
-        """Return list of capabilities this agent handles"""
-        return [
-            "billing_inquiries",
-            "payment_history",
-            "subscription_management",
-            "invoice_explanations",
-            "price_calculations",
-            "payment_disputes"
-        ]
-'''
-
-with open(f"{agents_dir}/billing_agent.py", 'w') as f:
-    f.write(billing_agent_code)
-
-print("✅ Created Billing Agent")
-
-# COMMAND ----------
-
-# DBTITLE 1,Implement Technical Agent
-technical_agent_code = '''"""
-Technical Agent - Specialized for technical support and troubleshooting
-"""
-import mlflow
-from agent import LangGraphResponsesAgent
-from mlflow.models import ModelConfig
-
-class TechnicalAgent(LangGraphResponsesAgent):
-    """Specialized agent for technical support and troubleshooting"""
-    
-    def __init__(self, catalog: str, schema: str):
-        # Load technical-specific configuration
-        config = ModelConfig(development_config="../configs/technical_agent_config.yaml")
-        
-        super().__init__(
-            uc_tool_names=config.get("uc_tool_names"),
-            llm_endpoint_name=config.get("llm_endpoint_name"),
-            system_prompt=config.get("system_prompt"),
-            retriever_config=config.get("retriever_config"),
-            max_history_messages=config.get("max_history_messages")
-        )
-        
-        self.agent_name = "Technical Agent"
-        self.specialization = "technical_support"
-    
-    def get_capabilities(self) -> list[str]:
-        """Return list of capabilities this agent handles"""
-        return [
-            "troubleshooting",
-            "error_codes",
-            "connectivity_issues",
-            "device_configuration",
-            "firmware_updates",
-            "network_problems",
-            "router_modem_issues",
-            "technician_dispatch"
-        ]
-'''
-
-with open(f"{agents_dir}/technical_agent.py", 'w') as f:
-    f.write(technical_agent_code)
-
-print("✅ Created Technical Agent")
-
-# COMMAND ----------
-
-# DBTITLE 1,Implement Retention Agent
-retention_agent_code = '''"""
-Retention Agent - Specialized for customer retention and satisfaction
-"""
-import mlflow
-from agent import LangGraphResponsesAgent
-from mlflow.models import ModelConfig
-
-class RetentionAgent(LangGraphResponsesAgent):
-    """Specialized agent for customer retention and churn prevention"""
-    
-    def __init__(self, catalog: str, schema: str):
-        # Load retention-specific configuration
-        config = ModelConfig(development_config="../configs/retention_agent_config.yaml")
-        
-        super().__init__(
-            uc_tool_names=config.get("uc_tool_names"),
-            llm_endpoint_name=config.get("llm_endpoint_name"),
-            system_prompt=config.get("system_prompt"),
-            retriever_config=config.get("retriever_config"),
-            max_history_messages=config.get("max_history_messages")
-        )
-        
-        self.agent_name = "Retention Agent"
-        self.specialization = "customer_retention"
-    
-    def get_capabilities(self) -> list[str]:
-        """Return list of capabilities this agent handles"""
-        return [
-            "churn_prevention",
-            "cancellation_requests",
-            "complaint_resolution",
-            "service_upgrades",
-            "loyalty_offers",
-            "vip_customer_handling",
-            "satisfaction_improvement"
-        ]
-'''
-
-with open(f"{agents_dir}/retention_agent.py", 'w') as f:
-    f.write(retention_agent_code)
-
-print("✅ Created Retention Agent")
-
-# COMMAND ----------
-
 # MAGIC %md
-# MAGIC ## Step 3: Create Supervisor Agent
+# MAGIC ## Step 3: Test Supervisor Agent
 # MAGIC
-# MAGIC The Supervisor Agent is the orchestrator that:
-# MAGIC 1. **Routes** incoming queries to the appropriate specialist
-# MAGIC 2. **Coordinates** multi-agent interactions when needed
-# MAGIC 3. **Aggregates** responses from multiple agents
-
-# COMMAND ----------
-
-# DBTITLE 1,Implement Supervisor Agent
-supervisor_agent_code = '''"""
-Supervisor Agent - Orchestrates multiple specialized agents
-"""
-import mlflow
-from typing import Literal, Optional, Any, Generator
-from langchain_core.messages import HumanMessage, AIMessage
-from databricks_langchain import ChatDatabricks
-from mlflow.types.responses import (
-    ResponsesAgentRequest,
-    ResponsesAgentResponse,
-    ResponsesAgentStreamEvent,
-)
-from mlflow.pyfunc import ResponsesAgent
-from mlflow.entities import SpanType
-import json
-
-# Import specialized agents
-import sys
-import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '02-agent-eval'))
-from billing_agent import BillingAgent
-from technical_agent import TechnicalAgent
-from retention_agent import RetentionAgent
-
-
-class SupervisorAgent(ResponsesAgent):
-    """
-    Supervisor agent that routes queries to specialized sub-agents.
-    
-    Architecture:
-        User Query → Supervisor (classify intent) → Specialist Agent → Response
-    """
-    
-    def __init__(self, catalog: str, schema: str, llm_endpoint: str):
-        self.catalog = catalog
-        self.schema = schema
-        self.llm_endpoint = llm_endpoint
-        
-        # Initialize router LLM
-        self.router_llm = ChatDatabricks(endpoint=llm_endpoint)
-        
-        # Initialize specialized agents
-        print("🤖 Initializing specialized agents...")
-        self.billing_agent = BillingAgent(catalog, schema)
-        self.technical_agent = TechnicalAgent(catalog, schema)
-        self.retention_agent = RetentionAgent(catalog, schema)
-        
-        self.agents = {
-            "billing": self.billing_agent,
-            "technical": self.technical_agent,
-            "retention": self.retention_agent
-        }
-        
-        print(f"✅ Supervisor initialized with {len(self.agents)} specialist agents")
-    
-    def route_query(self, query: str) -> Literal["billing", "technical", "retention"]:
-        """
-        Classify query intent and route to appropriate specialist agent.
-        
-        Args:
-            query: User's question
-            
-        Returns:
-            Agent name to route to: "billing", "technical", or "retention"
-        """
-        routing_prompt = f\"\"\"You are a query router for a customer support system. Classify this query into ONE category.
-
-Query: {query}
-
-Categories:
-1. billing - Payments, invoices, subscriptions, charges, bills, pricing, refunds
-2. technical - Device issues, errors, connectivity, troubleshooting, not working, slow internet, router, modem
-3. retention - Cancellations, complaints, dissatisfaction, "cancel service", "terrible service", upgrades
-
-Instructions:
-- Consider the primary intent of the query
-- If multiple intents, choose the most critical one
-- For cancellation/complaint queries, ALWAYS choose "retention"
-- For error codes or connectivity, choose "technical"
-- For payment/subscription queries, choose "billing"
-
-Respond with ONLY the category name: billing, technical, or retention\"\"\"
-        
-        response = self.router_llm.invoke([HumanMessage(content=routing_prompt)])
-        intent = response.content.strip().lower()
-        
-        # Validate and default to billing if uncertain
-        if intent not in ["billing", "technical", "retention"]:
-            intent = "billing"  # Safe default
-        
-        return intent
-    
-    @mlflow.trace(span_type=SpanType.AGENT, name="supervisor_predict")
-    def predict(self, request: ResponsesAgentRequest) -> ResponsesAgentResponse:
-        """
-        Main prediction method - routes to specialist and returns response.
-        """
-        # Extract query from request
-        query = request.input[0].content if request.input else ""
-        
-        # Route to appropriate agent
-        selected_agent_name = self.route_query(query)
-        selected_agent = self.agents[selected_agent_name]
-        
-        # Log routing decision
-        mlflow.update_current_trace(
-            attributes={
-                "supervisor.selected_agent": selected_agent_name,
-                "supervisor.query": query
-            }
-        )
-        
-        print(f"🎯 Supervisor routing to: {selected_agent_name.upper()} Agent")
-        
-        # Delegate to specialist agent
-        specialist_response = selected_agent.predict(request)
-        
-        # Add supervisor metadata to response
-        if hasattr(specialist_response, 'custom_outputs'):
-            if specialist_response.custom_outputs is None:
-                specialist_response.custom_outputs = {}
-            specialist_response.custom_outputs['routed_to'] = selected_agent_name
-            specialist_response.custom_outputs['supervisor'] = True
-        
-        return specialist_response
-    
-    @mlflow.trace(span_type=SpanType.AGENT, name="supervisor_predict_stream")
-    def predict_stream(
-        self, request: ResponsesAgentRequest
-    ) -> Generator[ResponsesAgentStreamEvent, None, None]:
-        """
-        Streaming prediction - routes to specialist agent's stream.
-        """
-        query = request.input[0].content if request.input else ""
-        
-        # Route to appropriate agent
-        selected_agent_name = self.route_query(query)
-        selected_agent = self.agents[selected_agent_name]
-        
-        print(f"🎯 Supervisor streaming from: {selected_agent_name.upper()} Agent")
-        
-        # Stream from specialist agent
-        yield from selected_agent.predict_stream(request)
-    
-    def get_resources(self):
-        """
-        Aggregate all resources needed by sub-agents.
-        """
-        all_resources = []
-        for agent in self.agents.values():
-            all_resources.extend(agent.get_resources())
-        
-        # Deduplicate resources
-        unique_resources = []
-        seen = set()
-        for resource in all_resources:
-            resource_key = f"{type(resource).__name__}:{resource.name}"
-            if resource_key not in seen:
-                seen.add(resource_key)
-                unique_resources.append(resource)
-        
-        return unique_resources
-    
-    def predict_multi_agent(self, request: ResponsesAgentRequest) -> dict[str, Any]:
-        """
-        Advanced: Handle queries requiring multiple agents.
-        
-        Example: "My bill is high and my internet is slow"
-            → Query billing agent AND technical agent
-            → Aggregate both responses
-        """
-        query = request.input[0].content if request.input else ""
-        
-        # Detect if multiple agents needed (simplified logic)
-        needs_billing = any(kw in query.lower() for kw in ['bill', 'payment', 'charge', 'subscription'])
-        needs_technical = any(kw in query.lower() for kw in ['error', 'not working', 'slow', 'broken'])
-        needs_retention = any(kw in query.lower() for kw in ['cancel', 'terrible', 'frustrated', 'complaint'])
-        
-        agents_needed = []
-        if needs_billing:
-            agents_needed.append("billing")
-        if needs_technical:
-            agents_needed.append("technical")
-        if needs_retention:
-            agents_needed.append("retention")
-        
-        # If multiple agents needed, coordinate them
-        if len(agents_needed) > 1:
-            print(f"🔀 Multi-agent query detected: {', '.join(agents_needed)}")
-            
-            responses = {}
-            for agent_name in agents_needed:
-                agent = self.agents[agent_name]
-                response = agent.predict(request)
-                responses[agent_name] = response['output'][-1]['content'][-1]['text']
-            
-            # Aggregate responses
-            aggregated = "Based on multiple specialist consultations:\\n\\n"
-            for agent_name, response_text in responses.items():
-                aggregated += f"**{agent_name.title()} Team:**\\n{response_text}\\n\\n"
-            
-            return {
-                "output": [{
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": aggregated
-                    }]
-                }],
-                "multi_agent": True,
-                "agents_used": list(agents_needed)
-            }
-        else:
-            # Single agent route
-            return self.predict(request)
-'''
-
-with open(f"{agents_dir}/supervisor_agent.py", 'w') as f:
-    f.write(supervisor_agent_code)
-
-print("✅ Created Supervisor Agent with routing logic")
+# MAGIC The agent files are already implemented in the `agents/` directory:
+# MAGIC - [billing_agent.py]($./agents/billing_agent.py) - Handles billing queries
+# MAGIC - [technical_agent.py]($./agents/technical_agent.py) - Handles technical support
+# MAGIC - [retention_agent.py]($./agents/retention_agent.py) - Handles retention/cancellation
+# MAGIC - [supervisor_agent.py]($./agents/supervisor_agent.py) - Orchestrates all specialists
+# MAGIC
+# MAGIC Let's import and test the supervisor!
 
 # COMMAND ----------
 
@@ -656,7 +308,7 @@ billing_response = billing_agent.predict({
 
 print(f"Query: {test_billing_query}")
 print(f"\n💬 Billing Agent Response:")
-print(billing_response['output'][-1]['content'][-1]['text'])
+print(billing_response.output[-1].content[-1]['text'])
 
 # COMMAND ----------
 
@@ -675,7 +327,7 @@ technical_response = technical_agent.predict({
 
 print(f"Query: {test_technical_query}")
 print(f"\n💬 Technical Agent Response:")
-print(technical_response['output'][-1]['content'][-1]['text'])
+print(technical_response.output[-1].content[-1]['text'])
 
 # COMMAND ----------
 
@@ -694,7 +346,7 @@ retention_response = retention_agent.predict({
 
 print(f"Query: {test_retention_query}")
 print(f"\n💬 Retention Agent Response:")
-print(retention_response['output'][-1]['content'][-1]['text'])
+print(retention_response.output[-1].content[-1]['text'])
 
 # COMMAND ----------
 
@@ -705,18 +357,12 @@ print(retention_response['output'][-1]['content'][-1]['text'])
 
 # COMMAND ----------
 
-# DBTITLE 1,Initialize Supervisor
-from agents.supervisor_agent import SupervisorAgent
+# DBTITLE 1,Import Supervisor Agent
+# Import the SUPERVISOR instance (following 02.1 pattern: "from agent import AGENT")
+from agents.supervisor_agent import SUPERVISOR
 
-print("🎯 Initializing Supervisor Agent...\n")
-
-supervisor = SupervisorAgent(
-    catalog=catalog,
-    schema=dbName,
-    llm_endpoint=LLM_ENDPOINT_NAME
-)
-
-print(f"✅ Supervisor ready with {len(supervisor.agents)} specialist agents")
+print("🎯 Supervisor Agent initialized...\n")
+print(f"✅ Supervisor ready with {len(SUPERVISOR.agents)} specialist agents")
 
 # COMMAND ----------
 
@@ -738,7 +384,7 @@ print("🎯 ROUTING DECISION TESTS")
 print("="*70 + "\n")
 
 for query in test_routing_cases:
-    routed_to = supervisor.route_query(query)
+    routed_to = SUPERVISOR.route_query(query)
     print(f"Query: {query}")
     print(f"  → Routed to: {routed_to.upper()} Agent")
     print()
@@ -779,12 +425,12 @@ for i, test_case in enumerate(test_cases, 1):
     print(f"Expected Agent: {test_case['expected_agent'].upper()}")
     print(f"{'='*70}\n")
     
-    response = supervisor.predict({
+    response = SUPERVISOR.predict({
         "input": [{"role": "user", "content": test_case['query']}]
     })
     
     print(f"💬 Response:\n")
-    print(response['output'][-1]['content'][-1]['text'])
+    print(response.output[-1].content[-1]['text'])
     print()
 
 # COMMAND ----------
@@ -858,7 +504,7 @@ true_agents = []
 
 for _, row in multi_agent_eval.iterrows():
     # Get routing decision
-    predicted = supervisor.route_query(row['question'])
+    predicted = SUPERVISOR.route_query(row['question'])
     predicted_agents.append(predicted)
     true_agents.append(row['expected_agent'])
     
@@ -908,14 +554,14 @@ scorers = [
 
 # Prepare for evaluation
 eval_questions = multi_agent_eval['question'].tolist()
-eval_data = pd.DataFrame({"question": eval_questions})
+eval_data = pd.DataFrame({"inputs": [{"question": q} for q in eval_questions]})
 
 # Prediction wrapper for supervisor
 def supervisor_predict_wrapper(question):
-    response = supervisor.predict({
+    response = SUPERVISOR.predict({
         "input": [{"role": "user", "content": question}]
     })
-    return response['output'][-1]['content'][-1]['text']
+    return response.output[-1].content[-1]['text']
 
 # Run evaluation
 print("🧪 Running quality evaluation on multi-agent system...\n")
@@ -1026,7 +672,7 @@ print("\nThis query requires BOTH billing and technical expertise!")
 print("="*70 + "\n")
 
 # Use supervisor's multi-agent coordination
-coordinated_response = supervisor.predict_multi_agent({
+coordinated_response = SUPERVISOR.predict_multi_agent({
     "input": [{"role": "user", "content": complex_query}]
 })
 
@@ -1047,18 +693,9 @@ if coordinated_response.get('multi_agent'):
 # COMMAND ----------
 
 # DBTITLE 1,Log Supervisor to MLflow
-# Create supervisor configuration
-supervisor_config = {
-    "config_version_name": "multi_agent_supervisor",
-    "architecture": "supervisor_with_specialists",
-    "specialist_agents": ["billing", "technical", "retention"],
-    "llm_endpoint_name": LLM_ENDPOINT_NAME,
-    "routing_strategy": "llm_based_classification"
-}
-
-supervisor_config_path = f"{configs_dir}/supervisor_config.yaml"
-with open(supervisor_config_path, 'w') as f:
-    yaml.dump(supervisor_config, f)
+# Note: supervisor_config and supervisor_config_path were already created earlier
+# Load config using MLflow's ModelConfig for validation
+model_config = mlflow.models.ModelConfig(development_config=supervisor_config_path)
 
 # Log supervisor agent to MLflow
 print("📦 Logging Multi-Agent Supervisor to MLflow...\n")
@@ -1069,26 +706,120 @@ with mlflow.start_run(run_name='multi_agent_supervisor_v1'):
     mlflow.log_metric("num_specialists", 3)
     mlflow.log_metric("routing_accuracy", accuracy)
     
-    # Log all agent configs as artifacts
+    # Log all agent configs as artifacts (YAML files)
     mlflow.log_artifact(f"{configs_dir}/billing_agent_config.yaml", "configs")
     mlflow.log_artifact(f"{configs_dir}/technical_agent_config.yaml", "configs")
     mlflow.log_artifact(f"{configs_dir}/retention_agent_config.yaml", "configs")
     mlflow.log_artifact(supervisor_config_path, "configs")
     
-    # Log supervisor agent code
-    mlflow.log_artifact(f"{agents_dir}/supervisor_agent.py", "agents")
-    mlflow.log_artifact(f"{agents_dir}/billing_agent.py", "agents")
-    mlflow.log_artifact(f"{agents_dir}/technical_agent.py", "agents")
-    mlflow.log_artifact(f"{agents_dir}/retention_agent.py", "agents")
-    
-    # Note: In production, you'd use mlflow.pyfunc.log_model with custom PyFunc wrapper
-    # For this demo, we're logging artifacts and configuration
+    # Log the multi-agent supervisor using Models-from-Code pattern
+    # CRITICAL: Use code_paths to include sub-agent files as importable modules
+    logged_supervisor = mlflow.pyfunc.log_model(
+        artifact_path="agent",
+        python_model="./agents/supervisor_agent.py",  # Main script (Models-from-Code)
+        code_paths=[
+            "./agents/billing_agent.py",    # Include as importable module
+            "./agents/technical_agent.py",  # Include as importable module
+            "./agents/retention_agent.py",  # Include as importable module
+            "../02-agent-eval/agent.py"     # Base agent class
+        ],
+        model_config=supervisor_config_path,
+        input_example={
+            "input": [{"role": "user", "content": "What's my current bill total?"}]
+        },
+        resources=SUPERVISOR.get_resources(),  # Aggregate all UC tools from sub-agents
+        extra_pip_requirements=[
+            "langchain>=0.1.0",
+            "langchain_core>=0.1.0", 
+            "langgraph>=0.0.20",
+            "databricks-langchain",
+            "unitycatalog-langchain[databricks]",
+            "databricks-connect"
+        ],
+        metadata={
+            "architecture": "multi_agent_supervisor",
+            "num_specialists": 3,
+            "routing_accuracy": accuracy
+        }
+    )
     
     run_id = mlflow.active_run().info.run_id
+    experiment_id = mlflow.active_run().info.experiment_id
     
 print(f"✅ Supervisor logged to MLflow")
 print(f"   Run ID: {run_id}")
-print(f"   Experiment: {mlflow.get_experiment(mlflow.active_run().info.experiment_id).name}")
+print(f"   Experiment: {mlflow.get_experiment(experiment_id).name}")
+print(f"   Model URI: runs:/{run_id}/agent")
+
+# COMMAND ----------
+
+# DBTITLE 1,Register Multi-Agent Supervisor to Unity Catalog
+from mlflow import MlflowClient
+
+UC_MODEL_NAME = f"{catalog}.{dbName}.multi_agent_supervisor"
+ENDPOINT_NAME = "multi_agent_supervisor_endpoint"
+
+print("📝 Registering Multi-Agent Supervisor to Unity Catalog...\n")
+
+# Register the model to UC
+client = MlflowClient()
+uc_registered_model_info = mlflow.register_model(
+    model_uri=f"runs:/{run_id}/agent", 
+    name=UC_MODEL_NAME, 
+    tags={
+        "architecture": "multi_agent_supervisor",
+        "specialists": "billing,technical,retention"
+    }
+)
+
+# Set alias for deployment
+client.set_registered_model_alias(
+    name=UC_MODEL_NAME, 
+    alias="production", 
+    version=uc_registered_model_info.version
+)
+
+print(f"✅ Model registered to Unity Catalog!")
+print(f"   Model Name: {UC_MODEL_NAME}")
+print(f"   Version: {uc_registered_model_info.version}")
+print(f"   Alias: @production")
+
+# Create HTML link to UC model
+displayHTML(f'<a href="/explore/data/models/{catalog}/{dbName}/multi_agent_supervisor" target="_blank">🔗 Open Unity Catalog to see Registered Model</a>')
+
+# COMMAND ----------
+
+# DBTITLE 1,Deploy to Model Serving Endpoint
+from databricks import agents
+
+print("🚀 Deploying Multi-Agent Supervisor to Model Serving...\n")
+
+# Check if already deployed
+existing_deployments = agents.get_deployments(
+    model_name=UC_MODEL_NAME, 
+    model_version=uc_registered_model_info.version
+)
+
+if len(existing_deployments) == 0:
+    # Deploy to Model Serving endpoint
+    deployment_info = agents.deploy(
+        UC_MODEL_NAME, 
+        uc_registered_model_info.version, 
+        endpoint_name=ENDPOINT_NAME,
+        tags={"architecture": "multi_agent"}
+    )
+    
+    print(f"✅ Multi-Agent Supervisor deployed to Model Serving!")
+    print(f"   Endpoint: {ENDPOINT_NAME}")
+    print(f"   Version: {uc_registered_model_info.version}")
+else:
+    print(f"ℹ️  Model already deployed")
+    print(f"   Endpoint: {ENDPOINT_NAME}")
+    print(f"   Version: {uc_registered_model_info.version}")
+
+print(f"\n💡 Test with SQL:")
+print(f"   SELECT ai_query('{UC_MODEL_NAME}', 'What is my bill?')")
+print(f"\n💡 Open the Review App to test interactively.")
 
 # COMMAND ----------
 

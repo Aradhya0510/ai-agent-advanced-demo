@@ -205,17 +205,31 @@ class LangGraphResponsesAgent(ResponsesAgent):
         return res
 
 
-# Load configuration values from YAML
-model_config = ModelConfig(development_config="../02-agent-eval/agent_config.yaml")
+# Only instantiate agent when this file is used as the primary model
+# Check if we're being loaded as the main model vs. imported as a library
+try:
+    # Try to check if another model has already been set
+    _is_primary_model = mlflow.models.model.__mlflow_model__ is None
+except:
+    _is_primary_model = True
 
-# Instantiate agent
-AGENT = LangGraphResponsesAgent(
-    uc_tool_names=model_config.get("uc_tool_names"),
-    llm_endpoint_name=model_config.get("llm_endpoint_name"),
-    system_prompt=model_config.get("system_prompt"),
-    retriever_config=model_config.get("retriever_config"),
-    max_history_messages=model_config.get("max_history_messages"),
-)
+if _is_primary_model:
+    try:
+        # Load configuration values from YAML
+        model_config = ModelConfig(development_config="../02-agent-eval/agent_config.yaml")
 
-# Register agent with MLflow for inference
-mlflow.models.set_model(AGENT)
+        # Instantiate agent
+        AGENT = LangGraphResponsesAgent(
+            uc_tool_names=model_config.get("uc_tool_names"),
+            llm_endpoint_name=model_config.get("llm_endpoint_name"),
+            system_prompt=model_config.get("system_prompt"),
+            retriever_config=model_config.get("retriever_config"),
+            max_history_messages=model_config.get("max_history_messages"),
+        )
+
+        # Register agent with MLflow for inference
+        mlflow.models.set_model(AGENT)
+    except Exception as e:
+        # If instantiation fails (e.g., wrong config), we're probably being imported
+        # Just make the class available without instantiating
+        pass

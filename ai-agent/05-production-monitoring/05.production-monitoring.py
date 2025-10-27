@@ -23,7 +23,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -U -qqqq mlflow[databricks]>=3.1.1 databricks-agents
+# MAGIC %pip install -U -qqqq mlflow[databricks]>=3.1.1 databricks-agents databricks-langchain
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------

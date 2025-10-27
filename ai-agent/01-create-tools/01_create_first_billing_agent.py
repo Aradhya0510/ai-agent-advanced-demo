@@ -19,7 +19,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Library Installs
-# MAGIC %pip install databricks-agents mlflow>=3.1.0 databricks-sdk==0.55.0 unitycatalog-ai[databricks]
+# MAGIC %pip install databricks-agents mlflow>=3.1.0 databricks-sdk==0.55.0 unitycatalog-ai[databricks] databricks-langchain
 # MAGIC # Restart to load the packages into the Python environment
 # MAGIC dbutils.library.restartPython()
 
