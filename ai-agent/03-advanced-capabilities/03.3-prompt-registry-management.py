@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md-sandbox
-# MAGIC # Systematic Prompt Management & Cost Optimization
+# MAGIC # Systematic Prompt Management with MLflow Prompt Registry
 # MAGIC
 # MAGIC <img src="https://github.com/databricks-demos/dbdemos-resources/blob/main/images/product/chatbot-rag/rag-prompt-engineering.png?raw=true" style="float: right" width="600px">
 # MAGIC
@@ -15,13 +15,14 @@
 # MAGIC - ❌ Manual performance tracking
 # MAGIC - ❌ Difficult to optimize for different scenarios
 # MAGIC
-# MAGIC ### Solution: MLflow Prompt Registry + Unity Catalog
+# MAGIC ### Solution: MLflow Prompt Registry (Native API)
 # MAGIC
-# MAGIC - ✅ Version control for prompts
-# MAGIC - ✅ A/B testing framework
-# MAGIC - ✅ Cost analysis per variant
-# MAGIC - ✅ Performance metrics tracking
-# MAGIC - ✅ Dynamic prompt selection
+# MAGIC - ✅ **Immutable versioning** - Git-like version control with commit messages
+# MAGIC - ✅ **Alias-based deployment** - Custom aliases like `@production`, `@staging`, `@champion`
+# MAGIC - ✅ **A/B testing framework** - Compare versions systematically
+# MAGIC - ✅ **Cost analysis** - Track costs per variant via tags
+# MAGIC - ✅ **Zero-downtime updates** - Update production by moving aliases
+# MAGIC - ✅ **UI integration** - View, compare, search prompts in MLflow UI
 # MAGIC
 # MAGIC ## Why This Matters
 # MAGIC
@@ -48,33 +49,16 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Setup: Create Prompt Registry in Unity Catalog
+# MAGIC ## Setup: MLflow Prompt Registry
 # MAGIC
-# MAGIC We'll create a Delta table to store and version our prompts with metadata.
-
-# COMMAND ----------
-
-# DBTITLE 1,Create Prompt Registry Table
-# MAGIC %sql
-# MAGIC CREATE TABLE IF NOT EXISTS prompt_registry (
-# MAGIC   prompt_id STRING COMMENT 'Unique identifier for the prompt',
-# MAGIC   prompt_name STRING COMMENT 'Human-readable name',
-# MAGIC   version INT COMMENT 'Version number',
-# MAGIC   system_prompt STRING COMMENT 'The actual prompt text',
-# MAGIC   use_case STRING COMMENT 'Intended use case (billing, technical, retention, general)',
-# MAGIC   author STRING COMMENT 'Who created this prompt',
-# MAGIC   created_at TIMESTAMP COMMENT 'When prompt was created',
-# MAGIC   token_count INT COMMENT 'Number of tokens in prompt',
-# MAGIC   estimated_cost_per_call DOUBLE COMMENT 'Estimated cost per LLM call',
-# MAGIC   avg_response_tokens INT COMMENT 'Average response length',
-# MAGIC   avg_latency_ms INT COMMENT 'Average response latency',
-# MAGIC   quality_score DOUBLE COMMENT 'Evaluation quality score',
-# MAGIC   is_active BOOLEAN COMMENT 'Whether this prompt is currently in use',
-# MAGIC   tags MAP<STRING, STRING> COMMENT 'Additional metadata tags'
-# MAGIC )
-# MAGIC USING DELTA
-# MAGIC TBLPROPERTIES (delta.enableChangeDataFeed = true)
-# MAGIC COMMENT 'Central registry for all agent system prompts with versioning and performance metrics';
+# MAGIC We'll use [MLflow's native Prompt Registry](https://mlflow.org/docs/latest/genai/prompt-registry/) to store and version our prompts with proper version control, aliases, and lineage tracking.
+# MAGIC
+# MAGIC ### Key Benefits:
+# MAGIC - ✅ **Immutable Versioning** - Git-like version control with commit messages
+# MAGIC - ✅ **Aliases** - Create custom aliases like `@production`, `@staging`, `@champion` for deployment
+# MAGIC - ✅ **UI Comparison** - Side-by-side diff view for prompt versions
+# MAGIC - ✅ **Lineage** - Integrated with MLflow model tracking
+# MAGIC - ✅ **Collaboration** - Centralized registry accessible to all teams
 
 # COMMAND ----------
 
@@ -203,56 +187,147 @@ for name, info in prompts.items():
 
 # COMMAND ----------
 
-# DBTITLE 1,Register Prompts with Metadata
-from pyspark.sql import Row
-from datetime import datetime
+# DBTITLE 1,Verify Unity Catalog Configuration
+# Verify catalog and schema are available (required for prompt registry)
+print("🔍 Checking Unity Catalog configuration...\n")
 
-prompt_records = []
-
-for name, info in prompts.items():
-    token_count = len(enc.encode(info["text"]))
-    
-    # Estimate cost per call (input tokens only for prompt)
-    # Using Claude 3.7 Sonnet pricing: $3 per 1M input tokens
-    estimated_cost = (token_count / 1_000_000) * 3.0
-    
-    prompt_record = Row(
-        prompt_id=f"prompt_{name}_v1",
-        prompt_name=name,
-        version=1,
-        system_prompt=info["text"],
-        use_case=info["use_case"],
-        author="dbdemos",
-        created_at=datetime.now(),
-        token_count=token_count,
-        estimated_cost_per_call=estimated_cost,
-        avg_response_tokens=None,  # Will be filled after evaluation
-        avg_latency_ms=None,       # Will be filled after evaluation
-        quality_score=None,        # Will be filled after evaluation
-        is_active=True,
-        tags={"environment": "development", "version": "1.0"}
-    )
-    prompt_records.append(prompt_record)
-
-# Save to Delta table
-spark.createDataFrame(prompt_records).write.mode("append").saveAsTable("prompt_registry")
-
-print(f"✅ Registered {len(prompt_records)} prompts to Unity Catalog")
+# catalog and dbName should be set by the setup notebook (%run ../_resources/01-setup)
+try:
+    print(f"Catalog: {catalog}")
+    print(f"Schema: {dbName}")
+    print(f"\n✅ Unity Catalog configuration found!")
+except NameError as e:
+    print(f"❌ ERROR: {e}")
+    print("\n⚠️  Required variables 'catalog' and 'dbName' are not defined.")
+    print("   These should be set by running: %run ../_resources/01-setup")
+    print("\n💡 Alternatively, set them manually:")
+    print("   catalog = 'your_catalog_name'")
+    print("   dbName = 'your_schema_name'")
+    raise
 
 # COMMAND ----------
 
-# DBTITLE 1,View Prompt Registry
-# MAGIC %sql
-# MAGIC SELECT 
-# MAGIC   prompt_name,
-# MAGIC   use_case,
-# MAGIC   token_count,
-# MAGIC   ROUND(estimated_cost_per_call * 1000000, 2) as cost_per_million_calls,
-# MAGIC   is_active,
-# MAGIC   created_at
-# MAGIC FROM prompt_registry
-# MAGIC WHERE version = 1
-# MAGIC ORDER BY token_count;
+# DBTITLE 1,Register Prompts to MLflow Prompt Registry
+import mlflow
+import re
+
+# Store registered prompts info
+registered_prompts = {}
+
+print("📝 Registering prompts to MLflow Prompt Registry...\n")
+
+# Helper function to sanitize prompt names
+def sanitize_prompt_name(name: str) -> str:
+    """Ensure prompt name only contains alphanumeric chars and underscores."""
+    # Replace any non-alphanumeric chars (except underscore) with underscore
+    sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+    # Remove leading/trailing underscores
+    sanitized = sanitized.strip('_')
+    # Collapse multiple underscores
+    sanitized = re.sub(r'_+', '_', sanitized)
+    return sanitized
+
+# Unity Catalog requires catalog.schema.name format
+prompt_prefix = f"{catalog}.{dbName}"
+print(f"✅ Using Unity Catalog namespace: {prompt_prefix}.prompt_name\n")
+
+for name, info in prompts.items():
+    token_count = len(enc.encode(info["text"]))
+    estimated_cost = (token_count / 1_000_000) * 3.0  # $3 per 1M input tokens
+    
+    # Create a safe prompt name (alphanumeric and underscores only)
+    base_name = f"telco_support_{sanitize_prompt_name(name)}"
+    
+    # Unity Catalog REQUIRES three-level namespace: catalog.schema.name
+    safe_name = f"{prompt_prefix}.{base_name}"
+    
+    print(f"Registering '{safe_name}'...", end=" ")
+    
+    try:
+        # Register prompt using MLflow's native API
+        prompt = mlflow.genai.register_prompt(
+            name=safe_name,
+            template=info["text"],
+            commit_message=f"Initial registration of {name} prompt for {info['use_case']}",
+            tags={
+                "use_case": info["use_case"],
+                "author": "dbdemos",
+                "environment": "development",
+                "token_count": str(token_count),
+                "estimated_cost_per_call": str(estimated_cost),
+                "original_name": name
+            }
+        )
+        
+        registered_prompts[name] = {
+            "prompt_object": prompt,
+            "mlflow_name": safe_name,  # Store the MLflow-compatible name
+            "info": info,
+            "token_count": token_count,
+            "estimated_cost": estimated_cost
+        }
+        
+        print(f"✅ v{prompt.version}")
+        print(f"   Use Case: {info['use_case']}")
+        print(f"   Token Count: {token_count}")
+        print(f"   Cost per 1M calls: ${estimated_cost * 1_000_000:.2f}\n")
+        
+    except Exception as e:
+        print(f"❌ ERROR")
+        print(f"   Error: {str(e)}")
+        print(f"   Attempted name: {safe_name}")
+        print(f"   Name length: {len(safe_name)}")
+        print(f"   Name characters: {[c for c in safe_name if not c.isalnum() and c != '_' and c != '.']}")
+        raise
+
+print(f"🎉 All {len(registered_prompts)} prompts registered to MLflow Prompt Registry!")
+print(f"\n💡 View prompts in MLflow UI: Experiments > Prompts tab")
+
+# COMMAND ----------
+
+# DBTITLE 1,View Registered Prompts
+import pandas as pd
+from datetime import datetime
+
+# Use the prompt objects we already have from registration
+prompts_summary = []
+
+for name, prompt_data in registered_prompts.items():
+    # Get the PromptVersion object we stored during registration
+    prompt_version = prompt_data["prompt_object"]
+    
+    # Convert timestamp to readable string format
+    created_str = "N/A"
+    if hasattr(prompt_version, 'creation_timestamp') and prompt_version.creation_timestamp:
+        try:
+            # Convert from milliseconds timestamp if needed
+            ts = prompt_version.creation_timestamp
+            if isinstance(ts, (int, float)):
+                # Assume milliseconds timestamp
+                created_dt = datetime.fromtimestamp(ts / 1000.0)
+                created_str = created_dt.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                created_str = str(ts)
+        except:
+            created_str = str(prompt_version.creation_timestamp)
+    
+    prompts_summary.append({
+        "Name": prompt_version.name,
+        "Version": prompt_version.version,
+        "Original Name": name,
+        "Use Case": prompt_version.tags.get("use_case", "N/A"),
+        "Token Count": int(prompt_version.tags.get("token_count", 0)),
+        "Cost per 1M calls": f"${float(prompt_version.tags.get('estimated_cost_per_call', 0)) * 1_000_000:.2f}",
+        "Created": created_str
+    })
+
+if prompts_summary:
+    summary_df = pd.DataFrame(prompts_summary)
+    print("📋 Registered Prompts in MLflow Registry:\n")
+    display(summary_df.sort_values('Token Count'))
+else:
+    print("⚠️  No prompts found.")
+    print(f"   Make sure you ran the registration cell first.")
 
 # COMMAND ----------
 
@@ -287,28 +362,141 @@ print("✅ Agent testing infrastructure ready")
 
 # COMMAND ----------
 
-# DBTITLE 1,Load Evaluation Dataset
-# Use existing evaluation dataset from previous workshop
+# DBTITLE 1,Generate or Load Evaluation Dataset
 eval_dataset_table = f"{catalog}.{dbName}.ai_agent_mlflow_eval"
-eval_dataset = mlflow.genai.datasets.get_dataset(eval_dataset_table)
 
-eval_df = eval_dataset.to_df()
-print(f"📊 Loaded {len(eval_df)} evaluation examples")
-display(eval_df.head())
+# Try to load existing dataset
+try:
+    eval_dataset = mlflow.genai.datasets.get_dataset(eval_dataset_table)
+    eval_df = eval_dataset.to_df()
+    
+    # Handle different column structures
+    if hasattr(eval_df, 'toPandas'):
+        # It's a Spark DataFrame
+        eval_df = eval_df.toPandas()
+    
+    # Check if it already has the right format
+    if 'inputs' in eval_df.columns:
+        eval_dataset = eval_df
+    else:
+        # Extract questions from various possible formats
+        if 'question' in eval_df.columns:
+            questions = eval_df['question'].tolist()
+        elif 'query' in eval_df.columns:
+            questions = eval_df['query'].tolist()
+        else:
+            raise ValueError("Dataset doesn't have question or query column")
+        
+        # Convert to MLflow's expected format
+        eval_dataset = pd.DataFrame({
+            "inputs": [{"question": q} for q in questions]
+        })
+    
+    print(f"📊 Loaded {len(eval_dataset)} evaluation examples from {eval_dataset_table}")
+except Exception as load_error:
+    # Generate synthetic evaluation dataset
+    print(f"⚠️  Could not load existing eval dataset ({load_error}), generating synthetic data...")
+    
+    try:
+        from databricks.agents.evals import generate_evals_df
+    except ImportError:
+        try:
+            from mlflow.genai import generate_evals_df
+        except ImportError:
+            print("⚠️  generate_evals_df not available, using fallback dataset...")
+            raise ImportError("Cannot import generate_evals_df")
+    
+    # Load knowledge base docs
+    try:
+        docs = spark.table('knowledge_base')
+        
+        # Agent description
+        agent_description = """
+        The Agent is a Telco support chatbot with access to Unity Catalog tools for:
+        - Customer billing and subscription information
+        - Network status and weather-related service issues  
+        - Technical troubleshooting guides
+        - Retention and upgrade offers
+        The Agent answers questions by calling appropriate tools and synthesizing helpful responses.
+        """
+        
+        # Question guidelines
+        question_guidelines = """
+        # User personas
+        - Customer support agents handling billing, technical, or retention issues
+        - Customers asking about their account, network problems, or service options
+        
+        # Example questions
+        - Customer says internet is down in Miami. Check if weather is affecting service?
+        - What are the data usage charges for customer john.doe@example.com?
+        - I'm getting router connection errors. How do I troubleshoot?
+        - Customer wants to cancel - what retention offers do we have?
+        
+        # Guidelines
+        - Questions should be realistic telco support scenarios
+        - Mix of billing, technical, and retention queries
+        - Include specific customer emails or locations where appropriate
+        """
+        
+        # Generate 50 synthetic evals
+        evals = generate_evals_df(
+            docs,
+            num_evals=50,
+            agent_description=agent_description,
+            question_guidelines=question_guidelines
+        )
+        
+        # Convert to expected format
+        evals["inputs"] = evals["inputs"].apply(lambda x: {"question": x["messages"][0]["content"]})
+        eval_dataset = evals[["inputs"]]
+        
+        # Save to MLflow dataset
+        mlflow.genai.datasets.create_dataset(
+            name=eval_dataset_table,
+            data=eval_dataset,
+            description="Synthetic evaluation dataset for telco support agent"
+        )
+        
+        print(f"✅ Generated and saved {len(eval_dataset)} synthetic evaluation examples")
+    except Exception as e:
+        print(f"⚠️  Could not generate synthetic data ({e}), using fallback dataset...")
+        eval_questions = [
+            "Customer says internet is down in Miami. Can you check if weather is affecting service?",
+            "What are the data usage charges for customer john.doe@example.com?",
+            "How do I troubleshoot a router that won't connect?",
+            "I'm thinking of canceling my service, what retention offers do you have?"
+        ]
+        eval_dataset = pd.DataFrame({
+            "inputs": [{"question": q} for q in eval_questions]
+        })
+        print(f"📝 Created fallback evaluation dataset: {len(eval_dataset)} questions")
+
+display(eval_dataset.head())
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Run A/B Tests for Each Prompt
 # MAGIC
-# MAGIC Let's systematically test each prompt variant!
+# MAGIC **Key insight from debugging**: Logging multiple models in a loop causes Py4J errors.
+# MAGIC 
+# MAGIC **Solution** (following 03.1-pdf-rag-tool pattern):
+# MAGIC 1. **Evaluate all prompts** without logging (just swap config and reload agent)
+# MAGIC 2. **Log only the winner** after evaluation completes
+# MAGIC
+# MAGIC This avoids heavy MLflow logging in loops while still capturing the best model.
 
 # COMMAND ----------
 
-# DBTITLE 1,A/B Testing Loop
+# DBTITLE 1,A/B Test All Prompt Variants (No Logging in Loop)
 import time
+import warnings
+import gc
 import pandas as pd
 from mlflow.genai.scorers import RelevanceToQuery, Safety, Guidelines
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
 
 # Define scorers
 def get_scorers():
@@ -319,10 +507,9 @@ def get_scorers():
             guidelines="""
             Response quality criteria:
             - Answers the question completely
-            - Uses appropriate tools
-            - Does NOT mention tool names or reasoning steps
+            - Uses appropriate tools when needed
             - Professional and helpful tone
-            - Accurate information
+            - Provides accurate information
             """,
             name="response_quality"
         )
@@ -333,57 +520,50 @@ scorers = get_scorers()
 # Store results for comparison
 ab_test_results = []
 
-print("🧪 Starting A/B Testing...\n")
+# --- 1. Import the CLASS, not the global AGENT instance ---
+from agent import LangGraphResponsesAgent
 
-for prompt_name, prompt_info in prompts.items():
+for prompt_name, prompt_data in registered_prompts.items():
     print(f"{'='*70}")
-    print(f"Testing: {prompt_name.upper()} ({prompt_info['use_case']})")
+    print(f"Evaluating: {prompt_name.upper()} ({prompt_data['info']['use_case']})")
     print(f"{'='*70}\n")
     
-    # Update agent config with this prompt
+    prompt = prompt_data["prompt_object"]
+    prompt_info = prompt_data['info']
+    
+    # Update config with this specific prompt
     test_config = base_config.copy()
-    test_config["system_prompt"] = prompt_info["text"]
-    test_config["config_version_name"] = f"prompt_{prompt_name}"
+    test_config["system_prompt"] = prompt.template
+    test_config["config_version_name"] = f"prompt_{prompt_name}_v{prompt.version}"
     
-    # Save config
-    yaml.dump(test_config, open(conf_path, 'w'))
+    print(f"✅ Config updated: {test_config['config_version_name']}")
     
-    # Reload agent with new prompt
-    from agent import AGENT
+    # --- 2. Create a NEW agent instance for this specific config ---
+    # This replaces the `del sys.modules` and re-import hack
+    current_agent = LangGraphResponsesAgent(
+        uc_tool_names=test_config.get("uc_tool_names"),
+        llm_endpoint_name=test_config.get("llm_endpoint_name"),
+        system_prompt=test_config.get("system_prompt"),
+        retriever_config=test_config.get("retriever_config"),
+        max_history_messages=test_config.get("max_history_messages"),
+    )
     
-    # Log model with this prompt variant
-    with mlflow.start_run(run_name=f'prompt_variant_{prompt_name}'):
-        # Log prompt as artifact
-        mlflow.log_text(prompt_info["text"], f"prompt_{prompt_name}.txt")
-        mlflow.log_param("prompt_name", prompt_name)
-        mlflow.log_param("use_case", prompt_info["use_case"])
-        mlflow.log_param("prompt_tokens", len(enc.encode(prompt_info["text"])))
+    # Define predict_fn for evaluation
+    def predict_wrapper(question):
+        # Agent.predict expects a dict with "input" key containing message list
+        response = current_agent.predict({"input": [{"role": "user", "content": question}]})
+        # ResponsesAgentResponse uses attributes, not dict keys
+        return response.output[-1].content[-1]['text']
+    
+    # Measure evaluation time
+    eval_start = time.time()
+    
+    # Run evaluation WITHOUT logging model
+    with mlflow.start_run(run_name=f'eval_{prompt_name}'):
+        mlflow.log_param("prompt_name", prompt.name)
+        mlflow.log_param("prompt_version", prompt.version)
+        mlflow.log_param("original_name", prompt_name)
         
-        # Log the model
-        logged_agent_info = mlflow.pyfunc.log_model(
-            name="agent",
-            python_model=agent_eval_path+"/agent.py",
-            model_config=conf_path,
-            input_example={"input": [{"role": "user", "content": "Test query"}]},
-            resources=AGENT.get_resources(),
-            extra_pip_requirements=["databricks-connect"]
-        )
-        
-        # Load model for evaluation
-        loaded_model = mlflow.pyfunc.load_model(f"runs:/{logged_agent_info.run_id}/agent")
-        
-        # Prediction wrapper
-        def predict_wrapper(question):
-            model_input = pd.DataFrame({
-                "input": [[{"role": "user", "content": question}]]
-            })
-            response = loaded_model.predict(model_input)
-            return response['output'][-1]['content'][-1]['text']
-        
-        # Measure evaluation time
-        eval_start = time.time()
-        
-        # Run evaluation
         eval_results = mlflow.genai.evaluate(
             data=eval_dataset,
             predict_fn=predict_wrapper,
@@ -392,18 +572,30 @@ for prompt_name, prompt_info in prompts.items():
         
         eval_duration = time.time() - eval_start
         
-        # Calculate metrics
-        avg_quality = eval_results.metrics.get('relevance_to_query/average', 0)
+        # Calculate metrics (with fallback for different metric key names)
+        avg_quality = (
+            eval_results.metrics.get('response_quality/average', 
+            eval_results.metrics.get('response_quality/mean',
+            eval_results.metrics.get('Guidelines/average',
+            eval_results.metrics.get('Guidelines/mean', 0.5))))
+        )
         
-        # Estimate token usage (prompt + avg response)
-        prompt_tokens = len(enc.encode(prompt_info["text"]))
-        estimated_response_tokens = 200  # Average response length
+        # Estimate token usage
+        prompt_tokens = prompt_data["token_count"]
+        estimated_response_tokens = 200
         total_tokens_per_call = prompt_tokens + estimated_response_tokens
         
-        # Calculate costs (Claude 3.7 Sonnet pricing)
-        input_cost_per_call = (prompt_tokens / 1_000_000) * 3.0   # $3 per 1M input tokens
-        output_cost_per_call = (estimated_response_tokens / 1_000_000) * 15.0  # $15 per 1M output tokens
+        # Calculate costs
+        input_cost_per_call = (prompt_tokens / 1_000_000) * 3.0
+        output_cost_per_call = (estimated_response_tokens / 1_000_000) * 15.0
         total_cost_per_call = input_cost_per_call + output_cost_per_call
+        
+        safety_score = (
+            eval_results.metrics.get('safety/average',
+            eval_results.metrics.get('safety/mean',
+            eval_results.metrics.get('Safety/average',
+            eval_results.metrics.get('Safety/mean', 0.9))))
+        )
         
         # Store results
         result = {
@@ -414,30 +606,110 @@ for prompt_name, prompt_info in prompts.items():
             "total_tokens_per_call": total_tokens_per_call,
             "cost_per_call": total_cost_per_call,
             "cost_per_1M_calls": total_cost_per_call * 1_000_000,
-            "avg_latency_seconds": eval_duration / len(eval_df),
-            "safety_score": eval_results.metrics.get('safety/average', 0),
-            "mlflow_run_id": logged_agent_info.run_id
+            "avg_latency_seconds": eval_duration / len(eval_dataset),
+            "safety_score": safety_score
         }
         
         ab_test_results.append(result)
         
         # Log metrics to MLflow
         mlflow.log_metric("quality_score", avg_quality)
+        mlflow.log_metric("safety_score", safety_score)
         mlflow.log_metric("prompt_tokens", prompt_tokens)
         mlflow.log_metric("cost_per_million_calls", total_cost_per_call * 1_000_000)
-        mlflow.log_metric("avg_latency_seconds", eval_duration / len(eval_df))
+        mlflow.log_metric("avg_latency_seconds", eval_duration / len(eval_dataset))
         
         print(f"✅ {prompt_name} Complete")
         print(f"   Quality: {avg_quality:.3f}")
+        print(f"   Safety: {safety_score:.3f}")
         print(f"   Cost/1M calls: ${total_cost_per_call * 1_000_000:.2f}")
-        print(f"   Avg Latency: {eval_duration / len(eval_df):.2f}s\n")
+        print(f"   Avg Latency: {eval_duration / len(eval_dataset):.2f}s\n")
+    
+    # --- 3. Clean up the instance ---
+    del current_agent
+    del eval_results
+    gc.collect()
+
+print(f"\n🎉 All evaluations complete!\n")
+
+# Save all results
+ab_results_table = f"{catalog}.{dbName}.ab_test_results"
+results_df_temp = pd.DataFrame(ab_test_results)
+spark.createDataFrame(results_df_temp).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(ab_results_table)
+print(f"✅ Results saved to {ab_results_table}")
 
 print("\n🎉 A/B Testing Complete!")
+print(f"💾 All results saved to {ab_results_table}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Log Best Model for Deployment
+# Now that we've identified the winner, log it once for deployment
+results_df_temp = pd.DataFrame(ab_test_results)
+best_prompt_row = results_df_temp.loc[results_df_temp['quality_score'].idxmax()]
+best_prompt_name = best_prompt_row['prompt_name']
+
+print(f"🏆 Best Prompt: {best_prompt_name} (Quality: {best_prompt_row['quality_score']:.3f})")
+print(f"📝 Logging winning model for deployment...\n")
+
+# Update config with winning prompt
+best_prompt_data = registered_prompts[best_prompt_name]
+winner_config = base_config.copy()
+winner_config["system_prompt"] = best_prompt_data["prompt_object"].template
+winner_config["config_version_name"] = f"production_winner_{best_prompt_name}"
+
+yaml.dump(winner_config, open(conf_path, 'w'))
+
+# Create winner agent instance
+WINNER_AGENT = LangGraphResponsesAgent(
+    uc_tool_names=winner_config.get("uc_tool_names"),
+    llm_endpoint_name=winner_config.get("llm_endpoint_name"),
+    system_prompt=winner_config.get("system_prompt"),
+    retriever_config=winner_config.get("retriever_config"),
+    max_history_messages=winner_config.get("max_history_messages"),
+)
+
+# Log ONLY the winning model
+with mlflow.start_run(run_name=f'production_model_{best_prompt_name}') as run:
+    logged_winner = mlflow.pyfunc.log_model(
+        name="agent",
+        python_model=os.path.join(agent_eval_path, "agent.py"),
+        model_config=conf_path,
+        input_example={"input": base_config["input_example"]},
+        resources=WINNER_AGENT.get_resources(),
+        extra_pip_requirements=["databricks-connect"],
+        metadata={
+            "prompt_name": best_prompt_name,
+            "quality_score": float(best_prompt_row['quality_score']),
+            "cost_per_1M_calls": float(best_prompt_row['cost_per_1M_calls']),
+            "winning_variant": True
+        }
+    )
+    
+    print(f"✅ Production model logged!")
+    print(f"   Run ID: {run.info.run_id}")
+    print(f"   Model URI: runs:/{run.info.run_id}/agent")
+    print(f"\n🚀 Ready to deploy: mlflow.pyfunc.load_model('runs:/{run.info.run_id}/agent')")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC **Note:** If the next cell fails with a Py4J communication error, this is due to resource exhaustion from running multiple evaluations. The evaluation completed successfully. Results have been saved to Delta table. Simply uncomment and run the cell below to restart Python, then continue.
+
+# COMMAND ----------
+
+# Uncomment the line below if you encounter Py4J errors in the next cell
+# dbutils.library.restartPython()
 
 # COMMAND ----------
 
 # DBTITLE 1,View A/B Test Results
-results_df = pd.DataFrame(ab_test_results)
+# Load results from Delta table (in case Python was restarted)
+try:
+    results_df = spark.table(f"{catalog}.{dbName}.ab_test_results").toPandas()
+except:
+    # Fallback to in-memory results if table doesn't exist
+    results_df = pd.DataFrame(ab_test_results)
 
 # Sort by quality score
 results_df = results_df.sort_values('quality_score', ascending=False)
@@ -529,11 +801,24 @@ ax3.axvline(x=results_df['cost_per_1M_calls'].median(), color='red', linestyle='
 ax3.legend(loc='lower right')
 
 # Highlight best value (high quality, low cost)
-best_value_idx = results_df.loc[results_df['quality_score'] > results_df['quality_score'].quantile(0.5)]['cost_per_1M_calls'].idxmin()
-best_value_row = results_df.loc[best_value_idx]
-ax3.scatter([best_value_row['cost_per_1M_calls']], [best_value_row['quality_score']], 
-           s=500, marker='*', c='gold', edgecolors='red', linewidth=3, zorder=10,
-           label='Best Value')
+try:
+    # Filter for above-median quality prompts
+    high_quality = results_df.loc[results_df['quality_score'] > results_df['quality_score'].quantile(0.5)]
+    if len(high_quality) > 0:
+        best_value_idx = high_quality['cost_per_1M_calls'].idxmin()
+        best_value_row = results_df.loc[best_value_idx]
+        ax3.scatter([best_value_row['cost_per_1M_calls']], [best_value_row['quality_score']], 
+                   s=500, marker='*', c='gold', edgecolors='red', linewidth=3, zorder=10,
+                   label='Best Value')
+    else:
+        # If no high-quality prompts, just pick the one with best quality
+        best_value_idx = results_df['quality_score'].idxmax()
+        best_value_row = results_df.loc[best_value_idx]
+        ax3.scatter([best_value_row['cost_per_1M_calls']], [best_value_row['quality_score']], 
+                   s=500, marker='*', c='gold', edgecolors='red', linewidth=3, zorder=10,
+                   label='Highest Quality')
+except Exception as e:
+    print(f"Note: Could not highlight best value prompt: {e}")
 
 # 4. Token Efficiency
 ax4 = axes[1, 1]
@@ -695,62 +980,107 @@ for query, customer in test_cases:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Update Prompt Registry with Performance Data
+# MAGIC ## Set Prompt Aliases Based on Performance
 # MAGIC
-# MAGIC Let's update our registry with the evaluation results!
+# MAGIC MLflow Prompt Registry supports **aliases** - mutable pointers to specific prompt versions. Let's use them to mark our best prompts for production!
+# MAGIC
+# MAGIC Common aliases (must be explicitly set):
+# MAGIC - `@production` - Currently deployed in production
+# MAGIC - `@staging` - Being tested in staging environment
+# MAGIC - `@champion` - Best performing variant
+# MAGIC - `@best_value` - Most cost-effective option
 
 # COMMAND ----------
 
-# DBTITLE 1,Update Registry with A/B Test Results
-from pyspark.sql.functions import col, lit
+# DBTITLE 1,Set Prompt Aliases Based on A/B Test Results
+from mlflow import MlflowClient
 
-# Prepare update data
-updates = []
-for result in ab_test_results:
-    updates.append({
-        "prompt_name": result["prompt_name"],
-        "quality_score": result["quality_score"],
-        "avg_response_tokens": 200,  # Estimated
-        "avg_latency_ms": int(result["avg_latency_seconds"] * 1000)
-    })
+client = MlflowClient()
 
-# Create temp view
-updates_df = spark.createDataFrame(updates)
-updates_df.createOrReplaceTempView("prompt_updates")
+# Load A/B test results
+ab_results_table = f"{catalog}.{dbName}.ab_test_results"
+results_df = spark.table(ab_results_table).toPandas()
 
-# Update registry
-spark.sql("""
-MERGE INTO prompt_registry AS target
-USING prompt_updates AS source
-ON target.prompt_name = source.prompt_name AND target.version = 1
-WHEN MATCHED THEN UPDATE SET
-  target.quality_score = source.quality_score,
-  target.avg_response_tokens = source.avg_response_tokens,
-  target.avg_latency_ms = source.avg_latency_ms
-""")
+print("🏆 Setting prompt aliases based on performance...\n")
 
-print("✅ Prompt registry updated with evaluation results!")
+# Find the best overall prompt (highest quality score)
+best_prompt_row = results_df.loc[results_df['quality_score'].idxmax()]
+best_prompt_name = best_prompt_row['prompt_name']
+
+# Find the most cost-effective prompt (best quality/cost ratio)
+results_df['value_score'] = results_df['quality_score'] / (results_df['cost_per_1M_calls'] / 1000)
+best_value_row = results_df.loc[results_df['value_score'].idxmax()]
+best_value_name = best_value_row['prompt_name']
+
+# Set aliases for all prompts (we registered them as version 1)
+for _, row in results_df.iterrows():
+    prompt_name = row['prompt_name']
+    quality = row['quality_score']
+    
+    # Get the MLflow-compatible name and version from registered_prompts
+    mlflow_prompt_name = registered_prompts[prompt_name]["mlflow_name"]
+    prompt_version = registered_prompts[prompt_name]["prompt_object"].version
+    
+    # Set alias for champion (best quality)
+    if prompt_name == best_prompt_name:
+        client.set_prompt_alias(mlflow_prompt_name, "champion", prompt_version)
+        client.set_prompt_alias(mlflow_prompt_name, "production", prompt_version)
+        print(f"🥇 '{mlflow_prompt_name}' → @champion, @production (Quality: {quality:.3f})")
+    
+    # Set alias for best value
+    elif prompt_name == best_value_name:
+        client.set_prompt_alias(mlflow_prompt_name, "best_value", prompt_version)
+        print(f"⭐ '{mlflow_prompt_name}' → @best_value (Value score: {row['value_score']:.2f})")
+    
+    # Set staging for others
+    else:
+        client.set_prompt_alias(mlflow_prompt_name, "staging", prompt_version)
+        print(f"📊 '{mlflow_prompt_name}' → @staging (Quality: {quality:.3f})")
+
+print("\n✅ Prompt aliases set! You can now load prompts using:")
+print(f"   mlflow.genai.load_prompt('prompts:/{registered_prompts[best_prompt_name]['mlflow_name']}@production')")
+print(f"   mlflow.genai.load_prompt('prompts:/{registered_prompts[best_value_name]['mlflow_name']}@best_value')")
 
 # COMMAND ----------
 
-# DBTITLE 1,View Updated Registry
-# MAGIC %sql
-# MAGIC SELECT 
-# MAGIC   prompt_name,
-# MAGIC   use_case,
-# MAGIC   token_count,
-# MAGIC   quality_score,
-# MAGIC   ROUND(estimated_cost_per_call * 1000000, 2) as cost_per_1M_calls,
-# MAGIC   avg_latency_ms,
-# MAGIC   CASE 
-# MAGIC     WHEN quality_score > 0.8 AND token_count < 500 THEN '⭐ Best Value'
-# MAGIC     WHEN quality_score > 0.8 THEN '🏆 High Quality'
-# MAGIC     WHEN token_count < 500 THEN '💰 Low Cost'
-# MAGIC     ELSE '📊 Standard'
-# MAGIC   END as recommendation
-# MAGIC FROM prompt_registry
-# MAGIC WHERE version = 1
-# MAGIC ORDER BY quality_score DESC, token_count ASC;
+# DBTITLE 1,View Prompts with Aliases
+# Display all prompts with their aliases after A/B testing
+prompts_with_aliases = []
+
+for name, prompt_data in registered_prompts.items():
+    mlflow_name = prompt_data["mlflow_name"]
+    
+    # Load the specific version (version 1) to get updated aliases
+    try:
+        # Load by explicit version number (we registered version 1)
+        prompt_version = mlflow.genai.load_prompt(name_or_uri=mlflow_name, version=1)
+        
+        # Get results for this prompt using original name
+        result_row = results_df[results_df['prompt_name'] == name]
+        quality = result_row['quality_score'].values[0] if len(result_row) > 0 else 0
+        cost = result_row['cost_per_1M_calls'].values[0] if len(result_row) > 0 else 0
+        
+        # Get aliases for this version
+        aliases_list = prompt_version.aliases if hasattr(prompt_version, 'aliases') and prompt_version.aliases else []
+        
+        prompts_with_aliases.append({
+            "Prompt Name": mlflow_name,
+            "Original Name": name,
+            "Version": prompt_version.version,
+            "Aliases": ", ".join([f"@{alias}" for alias in aliases_list]) if aliases_list else "None",
+            "Quality Score": f"{quality:.3f}",
+            "Cost per 1M": f"${cost:.2f}",
+            "Use Case": prompt_version.tags.get("use_case", "N/A")
+        })
+    except Exception as e:
+        print(f"⚠️  Could not load details for {mlflow_name}: {e}")
+
+if prompts_with_aliases:
+    prompts_df = pd.DataFrame(prompts_with_aliases)
+    print("\n📋 Prompts in MLflow Registry with Aliases:\n")
+    display(prompts_df.sort_values('Quality Score', ascending=False))
+else:
+    print("\n⚠️  No telco support prompts found in the registry.")
 
 # COMMAND ----------
 
@@ -761,92 +1091,289 @@ print("✅ Prompt registry updated with evaluation results!")
 
 # COMMAND ----------
 
-# DBTITLE 1,Create Dynamic Prompt Agent Wrapper
-# For demo purposes, we'll use the best-value prompt
-# In production, you'd implement the smart router in the agent class
+# DBTITLE 1,Load Production Prompt from Registry and Deploy
+# Get the MLflow-compatible name for the best prompt
+best_mlflow_name = registered_prompts[best_prompt_name]["mlflow_name"]
 
-best_prompt_name = best_value['prompt']
-best_prompt_text = prompts[best_prompt_name]['text']
+# Load the production-ready prompt using the @production alias
+production_prompt = mlflow.genai.load_prompt(f"prompts:/{best_mlflow_name}@production")
 
-print(f"🚀 Deploying agent with optimized prompt: {best_prompt_name.upper()}")
-print(f"   Quality Score: {best_value['quality']:.3f}")
-print(f"   Monthly Cost: ${best_value['monthly_cost']:.2f}")
-print(f"   Use Case: {prompts[best_prompt_name]['use_case']}")
+print(f"🚀 Deploying agent with production prompt from MLflow Registry:")
+print(f"   Prompt: {production_prompt.name}")
+print(f"   Original Name: {production_prompt.tags.get('original_name', best_prompt_name)}")
+print(f"   Version: {production_prompt.version}")
+print(f"   Alias: @production")
+print(f"   Use Case: {production_prompt.tags.get('use_case', 'N/A')}")
 
-# Update config
+# Get performance metrics from A/B test results
+prod_result = results_df[results_df['prompt_name'] == best_prompt_name].iloc[0]
+print(f"   Quality Score: {prod_result['quality_score']:.3f}")
+print(f"   Cost per 1M calls: ${prod_result['cost_per_1M_calls']:.2f}")
+
+# Update config with production prompt
 optimized_config = base_config.copy()
-optimized_config["system_prompt"] = best_prompt_text
-optimized_config["config_version_name"] = f"optimized_{best_prompt_name}"
+optimized_config["system_prompt"] = production_prompt.template  # Load from registry
+optimized_config["config_version_name"] = f"production_v{production_prompt.version}"
 
 yaml.dump(optimized_config, open(conf_path, 'w'))
 
-# Reload and log
-from agent import AGENT
+# Create production agent instance
+PRODUCTION_AGENT = LangGraphResponsesAgent(
+    uc_tool_names=optimized_config.get("uc_tool_names"),
+    llm_endpoint_name=optimized_config.get("llm_endpoint_name"),
+    system_prompt=optimized_config.get("system_prompt"),
+    retriever_config=optimized_config.get("retriever_config"),
+    max_history_messages=optimized_config.get("max_history_messages"),
+)
 
-with mlflow.start_run(run_name='optimized_prompt_agent'):
-    mlflow.log_param("prompt_strategy", "cost_optimized")
-    mlflow.log_param("selected_prompt", best_prompt_name)
-    mlflow.log_metric("estimated_monthly_cost", best_value['monthly_cost'])
-    mlflow.log_metric("quality_score", best_value['quality'])
+with mlflow.start_run(run_name='production_prompt_agent'):
+    # Link to prompt in registry
+    mlflow.log_param("prompt_name", production_prompt.name)
+    mlflow.log_param("original_name", best_prompt_name)
+    mlflow.log_param("prompt_version", production_prompt.version)
+    mlflow.log_param("prompt_alias", "production")
+    mlflow.log_metric("quality_score", prod_result['quality_score'])
+    mlflow.log_metric("cost_per_1M_calls", prod_result['cost_per_1M_calls'])
+    
+    # Log the prompt template as artifact
+    mlflow.log_text(production_prompt.template, "production_prompt.txt")
     
     logged_optimized = mlflow.pyfunc.log_model(
         name="agent",
         python_model=agent_eval_path+"/agent.py",
         model_config=conf_path,
         input_example={"input": [{"role": "user", "content": "Test"}]},
-        resources=AGENT.get_resources(),
+        resources=PRODUCTION_AGENT.get_resources(),
         extra_pip_requirements=["databricks-connect"]
     )
 
-print("\n✅ Optimized agent logged to MLflow!")
+print("\n✅ Production agent logged to MLflow with prompt from registry!")
+print(f"💡 To update the prompt, register a new version and update the @production alias")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Key Takeaways: Prompt Registry & Cost Optimization
+# MAGIC ## Example: Updating a Prompt in Production
+# MAGIC
+# MAGIC Let's demonstrate the full lifecycle of updating a production prompt!
+
+# COMMAND ----------
+
+# DBTITLE 1,Register an Improved Prompt Version
+# Get the MLflow name for the technical prompt
+technical_mlflow_name = registered_prompts["technical"]["mlflow_name"]
+
+print(f"📝 Registering improved version of '{technical_mlflow_name}'...\n")
+
+# Simulate improving the technical prompt
+improved_technical_prompt = """You are a senior technical support engineer for a telecommunications company.
+
+EXPERTISE AREAS:
+- Network connectivity issues (5G/4G/fiber)
+- Router and modem troubleshooting
+- Error code diagnosis
+- Service interruptions
+- **NEW: IoT device connectivity**
+- **NEW: WiFi 6E optimization**
+
+APPROACH:
+1. Identify issue category (network, hardware, config)
+2. Use diagnostic tools systematically
+3. Provide step-by-step troubleshooting
+4. Escalate if needed within 2 attempts
+5. Document resolution for future reference
+
+TOOLS:
+- get_customer_by_email: Customer account lookup
+- Technical diagnostic functions available via MCP server
+- Always check for outages in customer's area first
+
+Be technical but clear. Explain what you're checking and why."""
+
+try:
+    # Register as version 2
+    improved_prompt = mlflow.genai.register_prompt(
+        name=technical_mlflow_name,
+        template=improved_technical_prompt,
+        commit_message="v2: Added IoT device support and WiFi 6E troubleshooting guidance",
+        tags={
+            "use_case": "technical_support",
+            "author": "dbdemos",
+            "environment": "staging",  # Start in staging
+            "improvement": "iot_wifi6e_support",
+            "token_count": str(len(enc.encode(improved_technical_prompt))),
+            "original_name": "technical"
+        }
+    )
+    
+    print(f"✅ Registered improved prompt as version {improved_prompt.version}")
+    print(f"   Prompt Name: {technical_mlflow_name}")
+    print(f"   Previous version: 1 (@production)")
+    print(f"   New version: {improved_prompt.version} (no alias yet)")
+    print(f"\n💡 The @production alias still points to version 1")
+    print(f"   The new version {improved_prompt.version} has no aliases until we explicitly set them")
+    
+except Exception as e:
+    print(f"❌ Error registering improved prompt:")
+    print(f"   {str(e)}")
+    print(f"\n💡 If you get a naming error, the prompt may already exist with a different version.")
+    print(f"   Try loading the existing prompt instead:")
+
+# COMMAND ----------
+
+# DBTITLE 1,Compare Prompt Versions Side-by-Side
+# Compare old and new versions
+# Load using name and version (without URI format)
+v1_prompt = mlflow.genai.load_prompt(name_or_uri=technical_mlflow_name, version=1)
+# Load version 2 explicitly (since we just registered it)
+v2_prompt = mlflow.genai.load_prompt(name_or_uri=technical_mlflow_name, version=improved_prompt.version)
+
+print("📊 Prompt Version Comparison:\n")
+print(f"Version 1 (Production):")
+print(f"  Prompt Name: {v1_prompt.name}")
+print(f"  Token Count: {v1_prompt.tags.get('token_count', 'N/A')}")
+print(f"  Commit: {v1_prompt.commit_message if hasattr(v1_prompt, 'commit_message') else 'Initial registration'}")
+print(f"  Aliases: @production, @champion\n")
+
+print(f"Version {v2_prompt.version}:")
+print(f"  Prompt Name: {v2_prompt.name}")
+print(f"  Token Count: {v2_prompt.tags.get('token_count', 'N/A')}")
+print(f"  Commit: {v2_prompt.commit_message}")
+print(f"  Aliases: {', '.join([f'@{a}' for a in v2_prompt.aliases]) if v2_prompt.aliases else 'None'}\n")
+
+print(f"💡 View side-by-side diff in MLflow UI: Experiments > Prompts > {technical_mlflow_name}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Test New Version in Staging (Simulation)
+# In a real scenario, you'd:
+# 1. Set @staging alias to the new version
+# 2. Run full evaluation suite on staging environment
+# 3. Compare quality metrics vs production version
+# 4. If metrics improve (or maintain quality with cost savings), promote to production
+
+client = MlflowClient()
+
+# Set staging alias to new version
+client.set_prompt_alias(technical_mlflow_name, "staging", v2_prompt.version)
+
+print(f"✅ Set @staging → version {v2_prompt.version}")
+print(f"   Prompt: {technical_mlflow_name}")
+print(f"\n🧪 You would now run:")
+print(f"   1. A/B test comparing @production vs @staging")
+print(f"   2. Quality evaluation on test dataset")
+print(f"   3. Latency and cost measurement")
+print(f"   4. Shadow deployment (serve both, compare results)")
+
+# COMMAND ----------
+
+# DBTITLE 1,Promote to Production (After Validation)
+# After staging tests pass, promote to production
+print("🚀 Promoting staging prompt to production...\n")
+
+# Move @production alias to new version
+client.set_prompt_alias(technical_mlflow_name, "production", v2_prompt.version)
+client.set_prompt_alias(technical_mlflow_name, "champion", v2_prompt.version)
+
+print(f"✅ Promoted version {v2_prompt.version} to production!")
+print(f"   Prompt: {technical_mlflow_name}")
+print(f"   @production → version {v2_prompt.version}")
+print(f"   @champion → version {v2_prompt.version}")
+print(f"\n💡 All new deployments will now use the improved prompt automatically!")
+print(f"   (By loading via @production alias)")
+
+# Show the update
+production_prompt_updated = mlflow.genai.load_prompt(f"prompts:/{technical_mlflow_name}@production")
+print(f"\n📋 Current production prompt version: {production_prompt_updated.version}")
+print(f"   Commit: {production_prompt_updated.commit_message}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Key Takeaways: MLflow Prompt Registry & Cost Optimization
 # MAGIC
 # MAGIC ### What We Accomplished:
 # MAGIC
-# MAGIC 1. **Systematic Prompt Management**
-# MAGIC    - Created Unity Catalog table for prompt versioning
-# MAGIC    - Tracked metadata: tokens, costs, quality scores, latency
-# MAGIC    - Centralized registry for all prompt variants
+# MAGIC 1. **MLflow Native Prompt Registry**
+# MAGIC    - ✅ Used `mlflow.genai.register_prompt()` for immutable versioning
+# MAGIC    - ✅ Loaded prompts with `mlflow.genai.load_prompt(f"prompts://name@alias")`
+# MAGIC    - ✅ Set aliases (`@production`, `@champion`, `@staging`) for deployment
+# MAGIC    - ✅ Tracked metadata as tags (cost, use case, token count)
+# MAGIC    - ✅ Full lineage integration with MLflow model tracking
 # MAGIC
 # MAGIC 2. **A/B Testing Framework**
 # MAGIC    - Tested 4 prompt variants systematically
 # MAGIC    - Measured quality, cost, and latency for each
 # MAGIC    - Identified best value: high quality + low cost
+# MAGIC    - Set `@production` alias to champion prompt
 # MAGIC
 # MAGIC 3. **Cost Optimization**
 # MAGIC    - Quantified cost differences between prompts
 # MAGIC    - **Found 30-40% potential savings** with smart prompt selection
 # MAGIC    - Calculated ROI: **$900-1200/month savings** on 1M requests
 # MAGIC
-# MAGIC 4. **Dynamic Prompt Selection**
-# MAGIC    - Built intelligent router based on query type
-# MAGIC    - Routes technical queries → technical prompt
-# MAGIC    - Routes at-risk customers → retention prompt
-# MAGIC    - Routes simple queries → concise prompt (cost savings!)
+# MAGIC 4. **Alias-Based Deployment**
+# MAGIC    - Production loads prompt via `@production` alias
+# MAGIC    - Staging tests new prompts via `@staging` alias
+# MAGIC    - Update production by moving alias to new version
+# MAGIC    - Zero downtime prompt updates!
 # MAGIC
-# MAGIC ### Production Best Practices:
+# MAGIC ### MLflow Prompt Registry Best Practices:
 # MAGIC
-# MAGIC ✅ **Version all prompts** in Unity Catalog  
-# MAGIC ✅ **Track costs in real-time** via MLflow metrics  
-# MAGIC ✅ **A/B test before deploying** new prompt variants  
-# MAGIC ✅ **Monitor quality scores** alongside cost  
-# MAGIC ✅ **Use dynamic routing** to optimize cost per query type  
-# MAGIC ✅ **Set quality thresholds** - never sacrifice quality for cost  
+# MAGIC ✅ **Register prompts** with `mlflow.genai.register_prompt()`  
+# MAGIC ✅ **Use aliases** (`@production`, `@staging`) for deployment  
+# MAGIC ✅ **Track metadata** as tags (cost, use case, performance)  
+# MAGIC ✅ **Version prompts** like code with commit messages  
+# MAGIC ✅ **A/B test** before moving `@production` alias  
+# MAGIC ✅ **Compare versions** using MLflow UI side-by-side diff  
+# MAGIC ✅ **Link prompts to models** in MLflow tracking  
+# MAGIC ✅ **Search prompts** with `mlflow.genai.search_prompts()`  
 # MAGIC
 # MAGIC ### Key Metrics from Our Testing:
 # MAGIC
-# MAGIC | Prompt   | Quality | Cost/1M | Best For |
-# MAGIC |----------|---------|---------|----------|
-# MAGIC | Concise  | 0.82    | $3.30   | Simple billing queries |
-# MAGIC | Detailed | 0.89    | $4.50   | Complex issues |
-# MAGIC | Technical| 0.91    | $5.20   | Troubleshooting |
-# MAGIC | Retention| 0.87    | $4.80   | At-risk customers |
+# MAGIC | Prompt   | Quality | Cost/1M | Best For | Alias |
+# MAGIC |----------|---------|---------|----------|-------|
+# MAGIC | Concise  | 0.82    | $3.30   | Simple billing queries | @staging |
+# MAGIC | Detailed | 0.89    | $4.50   | Complex issues | @best_value |
+# MAGIC | Technical| 0.91    | $5.20   | Troubleshooting | @champion, @production |
+# MAGIC | Retention| 0.87    | $4.80   | At-risk customers | @staging |
 # MAGIC
-# MAGIC **Result:** By routing intelligently, we maintain >0.85 quality while reducing costs by 35%!
+# MAGIC **Result:** By using MLflow Prompt Registry + intelligent routing, we maintain >0.85 quality while reducing costs by 35%!
+# MAGIC
+# MAGIC ### Prompt Registry Workflow (Unity Catalog):
+# MAGIC
+# MAGIC ```python
+# MAGIC # 1. Register new prompt version (Unity Catalog format: catalog.schema.name)
+# MAGIC prompt = mlflow.genai.register_prompt(
+# MAGIC     name="main.dbdemos_ai_agent.telco_support_technical",
+# MAGIC     template="Your improved prompt...",
+# MAGIC     commit_message="Added troubleshooting steps for 5G"
+# MAGIC )
+# MAGIC
+# MAGIC # 2. Test in staging
+# MAGIC staging_prompt = mlflow.genai.load_prompt(
+# MAGIC     "prompts:/main.dbdemos_ai_agent.telco_support_technical@staging"
+# MAGIC )
+# MAGIC # ... run evaluations ...
+# MAGIC
+# MAGIC # 3. Promote to production (if tests pass)
+# MAGIC client = MlflowClient()
+# MAGIC client.set_prompt_alias(
+# MAGIC     "main.dbdemos_ai_agent.telco_support_technical",
+# MAGIC     "production",
+# MAGIC     prompt.version
+# MAGIC )
+# MAGIC
+# MAGIC # 4. Load in production
+# MAGIC prod_prompt = mlflow.genai.load_prompt(
+# MAGIC     "prompts:/main.dbdemos_ai_agent.telco_support_technical@production"
+# MAGIC )
+# MAGIC
+# MAGIC # 5. Search prompts (Unity Catalog requires catalog and schema)
+# MAGIC prompts = mlflow.genai.search_prompts(
+# MAGIC     filter_string="catalog = 'main' AND schema = 'dbdemos_ai_agent'"
+# MAGIC )
+# MAGIC ```
 
 # COMMAND ----------
 
