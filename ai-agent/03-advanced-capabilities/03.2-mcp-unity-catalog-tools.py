@@ -45,13 +45,73 @@
 # COMMAND ----------
 
 # DBTITLE 1,Install Required Packages
-# MAGIC %pip install -U -qqqq langgraph==0.5.3 uv databricks-agents mlflow-skinny[databricks] databricks-mcp databricks-langchain
+# MAGIC %pip install -U -qqqq langgraph==0.5.3 uv databricks-agents mlflow-skinny[databricks] databricks-mcp databricks-langchain nest-asyncio
 # MAGIC # Restart to load the packages into the Python environment
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
 
 # MAGIC %run ../_resources/01-setup
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Configuration Pattern
+# MAGIC
+# MAGIC Following the same pattern as other agents (`02.1_agent_evaluation.py`):
+# MAGIC 1. Load global `catalog` and `dbName` from `01-setup`
+# MAGIC 2. Dynamically create `mcp_agent_config.yaml` with these values
+# MAGIC 3. MCP agent reads config at initialization
+# MAGIC
+# MAGIC **Benefits:**
+# MAGIC - ✅ No hardcoded catalog/schema values
+# MAGIC - ✅ Consistent across all agents
+# MAGIC - ✅ Works in any environment (dev/staging/prod)
+
+# COMMAND ----------
+
+# DBTITLE 1,Create MCP Agent Configuration
+import yaml
+import os
+
+# Create MCP agent config using global catalog and dbName from setup
+mcp_agent_config = {
+    "config_version_name": "mcp_enhanced_agent",
+    "input_example": [{"role": "user", "content": "Customer in Seattle is reporting slow internet. Could weather be affecting their connection?"}],
+    "llm_endpoint_name": "databricks-claude-3-7-sonnet",
+    "catalog": catalog,  # Use global catalog from setup
+    "schema": dbName,    # Use global dbName from setup
+    "max_history_messages": 20,
+    "custom_mcp_server_urls": None,  # Optional: Add custom MCP server URLs (Databricks Apps with OAuth)
+    "system_prompt": """You are an expert telco support assistant with access to internal systems and external APIs via MCP protocol.
+
+TOOL USAGE GUIDELINES:
+- Use get_customer_by_email and get_customer_billing_and_subscriptions for customer data
+- Use get_weather_by_city when customer reports connectivity issues (weather may be a factor)
+- Use calculate_distance to estimate technician arrival times for on-site support
+- Use web_search_simulation for latest troubleshooting solutions not in documentation
+- Use calculate_math_expression for any calculations
+
+RESPONSE GUIDELINES:
+- Be professional, concise, and helpful
+- Cite sources when using web search results
+- Don't mention internal tool names or reasoning steps to the customer
+- Proactively offer relevant information"""
+}
+
+# Write config to file
+config_dir = "./configs"
+config_path = os.path.join(config_dir, 'mcp_agent_config.yaml')
+
+
+try:
+    with open(config_path, 'w') as f:
+        yaml.dump(mcp_agent_config, f, default_flow_style=False)
+    print(f"✅ Created MCP agent config at: {config_path}")
+    print(f"   Catalog: {catalog}")
+    print(f"   Schema: {dbName}")
+except Exception as e:
+    print(f'⚠️  Could not write config file: {e}')
 
 # COMMAND ----------
 
@@ -358,49 +418,159 @@ displayHTML(f"""
 # MAGIC %md
 # MAGIC ### Key Components in mcp_agent.py
 # MAGIC
-# MAGIC Open `mcp_agent.py` to see the implementation. Key components:
+# MAGIC Open `mcp_agent.py` to see the implementation. Key features:
 # MAGIC
-# MAGIC 1. **MCPTool Class**: Wraps MCP protocol calls
+# MAGIC 1. **Configuration**: Uses MLflow ModelConfig (matches `agent.py` pattern)
+# MAGIC    ```python
+# MAGIC    model_config = ModelConfig(development_config="configs/mcp_agent_config.yaml")
+# MAGIC    AGENT = LangGraphResponsesAgent(
+# MAGIC        catalog=model_config.get("catalog"),
+# MAGIC        schema=model_config.get("schema"),
+# MAGIC        custom_mcp_server_urls=model_config.get("custom_mcp_server_urls")  # Optional!
+# MAGIC    )
+# MAGIC    ```
+# MAGIC
+# MAGIC 2. **Dual MCP Server Support**: Managed (fast, PAT) + Custom (async, OAuth)
+# MAGIC    ```python
+# MAGIC    # Managed: Databricks-hosted UC function endpoints
+# MAGIC    managed_urls = [f"{host}/api/2.0/mcp/functions/{catalog}/{schema}"]
+# MAGIC    
+# MAGIC    # Custom: MCP servers hosted as Databricks Apps (optional)
+# MAGIC    custom_urls = ["https://<custom-app-url>/mcp"]
+# MAGIC    
+# MAGIC    # Async to support both types
+# MAGIC    tools = asyncio.run(create_mcp_tools(ws, managed_urls, custom_urls))
+# MAGIC    ```
+# MAGIC
+# MAGIC 3. **MCPTool Class**: Handles both sync and async execution
 # MAGIC    ```python
 # MAGIC    class MCPTool(BaseTool):
-# MAGIC        def _run(self, **kwargs) -> str:
-# MAGIC            mcp_client = DatabricksMCPClient(server_url=self.server_url, ...)
-# MAGIC            response = mcp_client.call_tool(self.name, kwargs)  # MCP JSON-RPC!
-# MAGIC            return response
+# MAGIC        def _run(self, **kwargs):
+# MAGIC            if self.is_custom:
+# MAGIC                return asyncio.run(self._run_custom_async(**kwargs))  # OAuth
+# MAGIC            else:
+# MAGIC                mcp_client = DatabricksMCPClient(...)  # PAT
+# MAGIC                return mcp_client.call_tool(self.name, kwargs)
 # MAGIC    ```
 # MAGIC
-# MAGIC 2. **Tool Discovery**: Dynamic via MCP protocol
-# MAGIC    ```python
-# MAGIC    mcp_client = DatabricksMCPClient(server_url=mcp_endpoint, ...)
-# MAGIC    available_tools = mcp_client.list_tools()  # Discovers all tools!
-# MAGIC    ```
+# MAGIC 4. **Tool Discovery**: Dynamic via MCP protocol
+# MAGIC    - Managed servers: Synchronous `DatabricksMCPClient.list_tools()`
+# MAGIC    - Custom servers: Async `ClientSession.list_tools()` with OAuth
 # MAGIC
-# MAGIC 3. **Agent Initialization**: Uses discovered MCP tools
+# MAGIC 5. **Agent Logging**: MLflow packages config automatically
 # MAGIC    ```python
-# MAGIC    def initialize_mcp_agent():
-# MAGIC        mcp_tools = create_mcp_tools(ws, mcp_endpoint)
-# MAGIC        agent = create_mcp_agent(llm, mcp_tools, system_prompt)
-# MAGIC        return LangGraphResponsesAgent(agent)
+# MAGIC    mlflow.pyfunc.log_model(python_model="mcp_agent.py", model_config=config_path)
 # MAGIC    ```
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### MCP Agent Configuration
+# MAGIC
+# MAGIC The MCP agent follows the same pattern as other agents in the project:
+# MAGIC - **Generated Dynamically**: Config is created from global `catalog` and `dbName` variables
+# MAGIC - **Location**: `configs/mcp_agent_config.yaml`
+# MAGIC - **Contains**: catalog, schema, LLM endpoint, system prompt, and other settings
+# MAGIC - **Benefits**: Consistent with setup, no hardcoded values, works across environments
+
+# COMMAND ----------
+
+# DBTITLE 1,View MCP Agent Config
+import yaml
+import os
+
+# Write config to file
+config_dir = "./configs"
+config_path = os.path.join(config_dir, 'mcp_agent_config.yaml')
+
+with open(config_path, 'r') as f:
+    mcp_config = yaml.safe_load(f)
+
+print("📋 MCP Agent Configuration (dynamically generated):")
+print(f"   Catalog: {mcp_config.get('catalog')}")
+print(f"   Schema: {mcp_config.get('schema')}")
+print(f"   LLM Endpoint: {mcp_config.get('llm_endpoint_name')}")
+print(f"   Max History Messages: {mcp_config.get('max_history_messages')}")
+print(f"\n   System Prompt Preview:")
+print(f"   {mcp_config.get('system_prompt', '')[:150]}...")
+
+displayHTML(f"""
+<div style="padding: 15px; background-color: #f0f7ff; border-left: 4px solid #0066cc; margin: 10px 0;">
+  <strong>💡 Configuration Pattern:</strong><br/>
+  Config is generated from global variables (<code>catalog</code>, <code>dbName</code>) set in <code>01-setup</code>.<br/>
+  Written to: <code>configs/mcp_agent_config.yaml</code><br/><br/>
+  <em>This ensures MCP agent uses the same catalog/schema as all other agents in the project.</em>
+</div>
+""")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Loading the MCP Agent
+# MAGIC
+# MAGIC **No restart needed** when running the notebook sequentially:
+# MAGIC - Python automatically loads `mcp_agent.py` on first import
+# MAGIC - Follows the same pattern as `02.1_agent_evaluation.py`
+# MAGIC - Preserves `catalog` and `dbName` variables from setup
+# MAGIC
+# MAGIC **When you WOULD need a restart:**
+# MAGIC - If you modified `mcp_agent.py` and want to reload changes
+# MAGIC - Solution: Use `dbutils.library.restartPython()` but then re-run setup cells
 
 # COMMAND ----------
 
 # DBTITLE 1,Load MCP Agent
-# Restart to ensure mcp_agent.py is available
-dbutils.library.restartPython()
-
-# COMMAND ----------
-
 # Import MCP agent (located in same directory)
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
 from mcp_agent import AGENT
 
 print(f"✅ MCP Agent loaded successfully")
 print(f"🔍 Agent uses MCP protocol for tool discovery and execution")
+print(f"📦 Agent has get_resources() method for MLflow logging")
+print(f"📋 Config loaded from: configs/mcp_agent_config.yaml")
 print(f"\nTo understand the MCP implementation, examine: mcp_agent.py")
+
+# COMMAND ----------
+
+# DBTITLE 1,Verify MCP Agent Setup
+# Verify that MCP agent is properly configured and resources are correct
+print("🔍 Verifying MCP Agent Configuration:\n")
+
+# 1. Check agent attributes
+print(f"1️⃣  Agent Configuration:")
+print(f"   - Catalog: {AGENT.catalog}")
+print(f"   - Schema: {AGENT.schema}")
+print(f"   - LLM Endpoint: {AGENT.llm_endpoint_name}")
+print(f"   - Number of MCP Tools: {len(AGENT.mcp_tools)}")
+
+# 2. Check MCP tool names
+print(f"\n2️⃣  MCP Tool Names (should be catalog__schema__function):")
+for i, tool in enumerate(AGENT.mcp_tools[:3], 1):  # Show first 3
+    print(f"   {i}. {tool.name}")
+if len(AGENT.mcp_tools) > 3:
+    print(f"   ... and {len(AGENT.mcp_tools) - 3} more")
+
+# 3. Check resource extraction
+resources = AGENT.get_resources()
+print(f"\n3️⃣  Extracted Resources ({len(resources)} total):")
+for resource in resources:
+    if hasattr(resource, 'endpoint_name'):
+        print(f"   🤖 LLM: {resource.endpoint_name}")
+    elif hasattr(resource, 'function_name'):
+        print(f"   🔧 UC Function: {resource.function_name}")
+
+# 4. Verify resource format
+print(f"\n4️⃣  Resource Format Validation:")
+has_llm = any(hasattr(r, 'endpoint_name') for r in resources)
+all_functions_valid = all(
+    '.' in r.function_name and '__' not in r.function_name 
+    for r in resources if hasattr(r, 'function_name')
+)
+print(f"   - Has LLM endpoint: {'✅' if has_llm else '❌'}")
+print(f"   - All UC functions use catalog.schema.function format: {'✅' if all_functions_valid else '❌'}")
+
+if has_llm and all_functions_valid:
+    print(f"\n✅ MCP Agent setup is CORRECT and ready for logging!")
 
 # COMMAND ----------
 
@@ -412,19 +582,13 @@ print(f"\nTo understand the MCP implementation, examine: mcp_agent.py")
 # COMMAND ----------
 
 # DBTITLE 1,Test 1: Weather-Related Network Issue
-import mlflow
-
-# Set experiment for tracking
-mlflow.set_experiment("/Users/" + spark.sql("SELECT current_user()").collect()[0][0] + "/mcp_agent_tests")
-
 test_query_1 = "Customer in Seattle is reporting very slow internet. Could weather be affecting their connection?"
 
 print(f"{'='*70}")
 print(f"❓ Query: {test_query_1}")
 print(f"{'='*70}\n")
 
-with mlflow.start_trace(name="weather_network_issue"):
-    answer_1 = AGENT.predict({"input":[{"role": "user", "content": test_query_1}]})
+answer_1 = AGENT.predict({"input":[{"role": "user", "content": test_query_1}]})
 
 print(f"\n💡 Agent Response:")
 if isinstance(answer_1, dict):
@@ -453,8 +617,7 @@ print(f"{'='*70}")
 print(f"❓ Query: {test_query_2}")
 print(f"{'='*70}\n")
 
-with mlflow.start_trace(name="technician_dispatch"):
-    answer_2 = AGENT.predict({"input":[{"role": "user", "content": test_query_2}]})
+answer_2 = AGENT.predict({"input":[{"role": "user", "content": test_query_2}]})
 
 print(f"\n💡 Agent Response:")
 if isinstance(answer_2, dict):
@@ -476,8 +639,7 @@ print(f"{'='*70}")
 print(f"❓ Query: {test_query_3}")
 print(f"{'='*70}\n")
 
-with mlflow.start_trace(name="web_search_troubleshooting"):
-    answer_3 = AGENT.predict({"input":[{"role": "user", "content": test_query_3}]})
+answer_3 = AGENT.predict({"input":[{"role": "user", "content": test_query_3}]})
 
 print(f"\n💡 Agent Response:")
 if isinstance(answer_3, dict):
@@ -527,34 +689,6 @@ display(eval_df)
 
 # COMMAND ----------
 
-# DBTITLE 1,Run MCP Agent Evaluation
-from mlflow.genai.scorers import RelevanceToQuery, AnswerCorrectness
-
-# Create evaluation dataset
-eval_dataset = pd.DataFrame({
-    "inputs": [{"input": [{"role": "user", "content": item["request"]}]} for item in mcp_eval_data],
-    "expected_response": [item["expected_response"] for item in mcp_eval_data]
-})
-
-# Define scorers
-scorers = [
-    RelevanceToQuery(),
-    AnswerCorrectness()
-]
-
-# Run evaluation
-print("Running MCP agent evaluation...")
-with mlflow.start_run(run_name="mcp_agent_evaluation"):
-    results = mlflow.genai.evaluate(
-        data=eval_dataset,
-        predict_fn=lambda input: AGENT.predict({"input": input}),
-        scorers=scorers
-    )
-
-print("\n✅ Evaluation complete! Check MLflow for detailed results.")
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC ## Part 6: Log and Register MCP Agent
 # MAGIC
@@ -563,34 +697,16 @@ print("\n✅ Evaluation complete! Check MLflow for detailed results.")
 # COMMAND ----------
 
 # DBTITLE 1,Log MCP Agent to MLflow
-from mlflow.models.resources import DatabricksServingEndpoint, DatabricksFunction
-from pkg_resources import get_distribution
-
-# Define resources (UC functions + LLM endpoint)
-resources = [
-    DatabricksServingEndpoint(endpoint_name="databricks-claude-3-7-sonnet"),
-    DatabricksFunction(function_name=f"{catalog}.{dbName}.get_weather_by_city"),
-    DatabricksFunction(function_name=f"{catalog}.{dbName}.calculate_distance"),
-    DatabricksFunction(function_name=f"{catalog}.{dbName}.web_search_simulation"),
-    DatabricksFunction(function_name=f"{catalog}.{dbName}.get_customer_by_email"),
-    DatabricksFunction(function_name=f"{catalog}.{dbName}.get_customer_billing_and_subscriptions"),
-]
-
 print("📦 Logging MCP agent to MLflow...")
 
-with mlflow.start_run(run_name="mcp_agent_model"):
+with mlflow.start_run(run_name=mcp_agent_config.get('config_version_name')):
     logged_agent_info = mlflow.pyfunc.log_model(
         name="mcp_agent",
-        python_model="mcp_agent.py",  # Our MCP agent file
+        python_model="mcp_agent.py",
+        model_config=config_path,  # MLflow packages this config file automatically
         input_example={"input": [{"role": "user", "content": "What's the weather in Seattle?"}]},
-        resources=resources,
-        pip_requirements=[
-            f"databricks-mcp=={get_distribution('databricks-mcp').version}",
-            f"langgraph=={get_distribution('langgraph').version}",
-            f"mcp=={get_distribution('mcp').version}",
-            f"databricks-langchain=={get_distribution('databricks-langchain').version}",
-            "mlflow>=3.1.0",
-        ]
+        resources=AGENT.get_resources(),
+        extra_pip_requirements=["databricks-connect"]
     )
 
 print(f"✅ MCP Agent logged successfully!")
@@ -621,7 +737,85 @@ print(f"✅ Registered: {UC_MODEL_NAME} version {uc_registered_model_info.versio
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Part 8: Deploy MCP Agent
+# MAGIC ## Part 8: Evaluate MCP Agent
+# MAGIC
+# MAGIC Now let's run evaluation on the logged MCP agent.
+
+# COMMAND ----------
+
+# DBTITLE 1,Prepare MLflow Evaluation Dataset
+from mlflow.genai.scorers import RelevanceToQuery, Safety, Guidelines
+import pandas as pd
+
+# Prepare evaluation dataset using MLflow dataset API
+# MLflow expects 'inputs' column to contain dictionaries
+eval_questions = [item["request"] for item in mcp_eval_data]
+# Each input must be a dict - wrap questions in dict format
+mcp_eval_dataset_df = pd.DataFrame({"inputs": [{"question": q} for q in eval_questions]})
+
+# Create or get MLflow dataset
+mcp_eval_table_mlflow = f"{catalog}.{dbName}.mcp_agent_eval_mlflow"
+
+# Drop existing table first to avoid schema conflicts
+spark.sql(f"DROP TABLE IF EXISTS {mcp_eval_table_mlflow}")
+print(f"Dropped existing table {mcp_eval_table_mlflow} (if it existed)")
+
+# Create new MLflow dataset
+try:
+    eval_dataset = mlflow.genai.datasets.create_dataset(mcp_eval_table_mlflow)
+    eval_dataset.merge_records(spark.createDataFrame(mcp_eval_dataset_df))
+    print(f"✅ Created evaluation dataset with {len(eval_questions)} records.")
+except Exception as e:
+    if 'already exists' in str(e).lower():
+        # If dataset metadata exists but table was dropped, get it
+        eval_dataset = mlflow.genai.datasets.get_dataset(mcp_eval_table_mlflow)
+        print(f"✅ Retrieved existing evaluation dataset.")
+    else:
+        raise e
+
+# COMMAND ----------
+
+# DBTITLE 1,Define Scorers
+# Get scorers (reusing setup from previous notebooks)
+def get_scorers():
+    """Define scorers for agent evaluation"""
+    return [
+        RelevanceToQuery(),
+        Safety(),
+        Guidelines(
+            guidelines="The assistant should use appropriate tools (weather, distance, web search, or internal data) to answer queries. It should provide accurate and helpful responses."
+        )
+    ]
+
+scorers = get_scorers()
+print(f"✅ Configured {len(scorers)} scorers for evaluation")
+
+# COMMAND ----------
+
+# DBTITLE 1,Run MCP Agent Evaluation
+# Load the logged model and create a prediction function
+loaded_model = mlflow.pyfunc.load_model(f"runs:/{logged_agent_info.run_id}/mcp_agent")
+
+def predict_wrapper(question):
+    """Wrapper function for evaluation that handles model input/output format"""
+    # Format for chat-style models (question parameter matches the dict key)
+    model_input = pd.DataFrame({
+        "input": [[{"role": "user", "content": question}]]
+    })
+    response = loaded_model.predict(model_input)
+    return response['output'][-1]['content'][-1]['text']
+
+# Run evaluation
+print("Running MCP agent evaluation...")
+with mlflow.start_run(run_name='eval_mcp_enhanced_agent'):
+    results = mlflow.genai.evaluate(data=eval_dataset, predict_fn=predict_wrapper, scorers=scorers)
+
+print("\n✅ Evaluation complete! Check MLflow experiment for detailed results.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Part 9: Deploy MCP Agent
 
 # COMMAND ----------
 
@@ -644,6 +838,11 @@ print(f"   Endpoint: {deployment_info}")
 # MAGIC %md
 # MAGIC ## Summary: What You Learned
 # MAGIC
+# MAGIC ### ✅ Configuration Pattern
+# MAGIC - Config dynamically generated from global `catalog` and `dbName` variables (like `02.1_agent_evaluation.py`)
+# MAGIC - Ensures consistency across all agents in the project
+# MAGIC - No hardcoded values - works in any environment
+# MAGIC
 # MAGIC ### ✅ UC Functions for External APIs
 # MAGIC - Created functions that wrap external API calls (weather, distance, web search)
 # MAGIC - These functions are stored in Unity Catalog for governance
@@ -657,16 +856,18 @@ print(f"   Endpoint: {deployment_info}")
 # MAGIC
 # MAGIC | Aspect | agent.py (Direct UC) | mcp_agent.py (MCP) |
 # MAGIC |--------|---------------------|-------------------|
+# MAGIC | Configuration | Static YAML | Dynamic from setup |
 # MAGIC | Tool Loading | `UCFunctionToolkit(function_names=[...])` | `mcp_client.list_tools()` |
 # MAGIC | Discovery | Static (config file) | Dynamic (protocol) |
 # MAGIC | Execution | Python SDK → UC | HTTP → MCP Server → UC |
 # MAGIC | Network | Internal only | Can cross boundaries |
 # MAGIC | Protocol | Databricks proprietary | Standardized MCP |
 # MAGIC
-# MAGIC ### ✅ Evaluation, Logging, Deployment
-# MAGIC - Created evaluation dataset specific to MCP tool usage
-# MAGIC - Logged MCP agent with proper dependencies
-# MAGIC - Registered and deployed to Model Serving
+# MAGIC ### ✅ Logging, Evaluation, and Deployment
+# MAGIC - Logged MCP agent with automatic resource discovery via `get_resources()` (Part 6)
+# MAGIC - Registered to Unity Catalog (Part 7)
+# MAGIC - Created evaluation dataset and ran MLflow evaluation with correct scorers (Part 8)
+# MAGIC - Deployed to Model Serving (Part 9)
 # MAGIC
 # MAGIC ### 🎯 When to Use Each Pattern
 # MAGIC - **Direct UC** (agent.py): Simple internal data queries, faster execution
