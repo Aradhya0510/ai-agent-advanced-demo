@@ -289,11 +289,6 @@ import sys
 sys.path.append(os.path.join(os.getcwd(), "agents"))
 sys.path.append(os.path.join(os.getcwd(), "../02-agent-eval"))
 
-# Set MLflow experiment
-import mlflow
-agent_eval_path = os.path.abspath(os.path.join(os.getcwd(), "../02-agent-eval"))
-mlflow.set_experiment(agent_eval_path+"/02.1_agent_evaluation")
-
 from agents.billing_agent import BillingAgent
 
 print("🧪 Testing Billing Agent...\n")

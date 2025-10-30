@@ -351,9 +351,6 @@ import os
 agent_eval_path = os.path.abspath(os.path.join(os.getcwd(), "../02-agent-eval"))
 sys.path.append(agent_eval_path)
 
-# Set experiment
-mlflow.set_experiment(agent_eval_path+"/02.1_agent_evaluation")
-
 # Load base configuration
 conf_path = os.path.join(agent_eval_path, 'agent_config.yaml')
 base_config = yaml.safe_load(open(conf_path))
