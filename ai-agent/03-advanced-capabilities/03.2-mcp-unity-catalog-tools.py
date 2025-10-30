@@ -45,7 +45,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Install Required Packages
-# MAGIC %pip install -U -qqqq databricks-agents mlflow>=3.1.0 databricks-sdk==0.55.0 unitycatalog-ai[databricks] databricks-langchain databricks-mcp langgraph==0.5.3 mcp
+# MAGIC %pip install -U -qqqq langgraph==0.5.3 uv databricks-agents mlflow-skinny[databricks] databricks-mcp databricks-langchain
 # MAGIC # Restart to load the packages into the Python environment
 # MAGIC dbutils.library.restartPython()
 
