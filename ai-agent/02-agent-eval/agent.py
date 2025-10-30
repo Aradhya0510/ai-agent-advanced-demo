@@ -100,7 +100,7 @@ class LangGraphResponsesAgent(ResponsesAgent):
                     index_name=retriever_config.get("index_name"),
                     name=retriever_config.get("tool_name", "retriever"),
                     description=retriever_config.get("description", "Vector search tool"),
-                    num_results=retriever_config.get("num_results", 3),
+                    max_results=retriever_config.get("num_results", 3),
                 )
             )
 
