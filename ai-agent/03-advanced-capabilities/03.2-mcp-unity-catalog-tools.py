@@ -4,39 +4,40 @@
 # MAGIC
 # MAGIC <img src="https://github.com/databricks-demos/dbdemos-resources/blob/main/images/product/llm-tools-functions/ai-agent-functions.png?raw=true" style="float: right" width="600px">
 # MAGIC
-# MAGIC ## From UC Functions to MCP Tools
+# MAGIC ## From Direct UC Calls to MCP Protocol
 # MAGIC
-# MAGIC **Recap from Previous Workshop:**
-# MAGIC - We created Unity Catalog functions from SQL and Python
-# MAGIC - Functions like `get_customer_by_email`, `get_customer_billing_and_subscriptions`
-# MAGIC - These were internal data tools
-# MAGIC
-# MAGIC **Today's Advanced Capability:**
-# MAGIC Let's integrate **external APIs** using **Databricks Managed MCP Server**
+# MAGIC **Journey So Far:**
+# MAGIC - ✅ **02.1**: Created UC functions, built agent with direct UC calling pattern
+# MAGIC - ✅ **03.1**: Added RAG with vector search
+# MAGIC - 🆕 **03.2**: Learn MCP (Model Context Protocol) for standardized tool calling
 # MAGIC
 # MAGIC ### What is MCP (Model Context Protocol)?
 # MAGIC
-# MAGIC MCP is a standard protocol that enables LLMs to:
+# MAGIC MCP is a **standardized protocol** that enables LLMs to:
 # MAGIC - Call external APIs securely
 # MAGIC - Access real-time data (weather, location, web search)
 # MAGIC - Integrate with third-party services
-# MAGIC - Maintain consistent tool interfaces across frameworks
+# MAGIC - Work across different agent frameworks
 # MAGIC
-# MAGIC ### Why Use MCP?
+# MAGIC ### Why Use MCP vs Direct UC?
 # MAGIC
-# MAGIC 1. **Standardization**: Consistent tool definitions across different agent frameworks
-# MAGIC 2. **Security**: Managed credential handling through Databricks secrets
-# MAGIC 3. **Governance**: All tools registered in Unity Catalog for audit and access control
-# MAGIC 4. **Interoperability**: Works with any MCP-compatible client
+# MAGIC | Aspect | Direct UC (02.1, 03.1) | MCP Protocol (03.2) |
+# MAGIC |--------|------------------------|---------------------|
+# MAGIC | **Pattern** | `UCFunctionToolkit` loads functions via Python SDK | `DatabricksMCPClient` connects to MCP server via HTTP |
+# MAGIC | **Discovery** | Hardcoded list in config | Dynamic via `list_tools()` |
+# MAGIC | **Execution** | Direct Python → UC function | Python → MCP Client → HTTP → MCP Server → UC |
+# MAGIC | **Network** | Internal only | Can cross network boundaries |
+# MAGIC | **Protocol** | Databricks SDK | Standardized MCP (JSON-RPC) |
+# MAGIC | **Use Case** | Simple internal tools | External APIs, interoperability |
 # MAGIC
 # MAGIC ### Databricks MCP Server
 # MAGIC
-# MAGIC Databricks provides a managed MCP server at:
+# MAGIC Databricks provides a **managed MCP server** that automatically exposes UC functions:
 # MAGIC ```
 # MAGIC https://<workspace-hostname>/api/2.0/mcp/functions/{catalog}/{schema}
 # MAGIC ```
 # MAGIC
-# MAGIC This endpoint exposes all your UC functions as MCP-compliant tools!
+# MAGIC This endpoint serves all UC functions in that schema via MCP protocol!
 # MAGIC
 # MAGIC <!-- Collect usage data (view). Remove it to disable collection or disable tracker during installation. View README for more details.  -->
 # MAGIC <img width="1px" src="https://ppxrzfxige.execute-api.us-west-2.amazonaws.com/v1/analytics?category=data-science&org_id=1444828305810485&notebook=%2F03-advanced-capabilities%2F03.2-mcp-unity-catalog-tools&demo_name=ai-agent&event=VIEW&path=%2F_dbdemos%2Fdata-science%2Fai-agent%2F03-advanced-capabilities%2F03.2-mcp-unity-catalog-tools&version=1">
@@ -44,7 +45,8 @@
 # COMMAND ----------
 
 # DBTITLE 1,Install Required Packages
-# MAGIC %pip install -U -qqqq databricks-agents mlflow>=3.1.0 databricks-sdk==0.55.0 unitycatalog-ai[databricks] langchain-community tavily-python requests databricks-langchain
+# MAGIC %pip install -U -qqqq databricks-agents mlflow>=3.1.0 databricks-sdk==0.55.0 unitycatalog-ai[databricks] databricks-langchain databricks-mcp langgraph==0.5.3 mcp
+# MAGIC # Restart to load the packages into the Python environment
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -54,28 +56,29 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Use Case: Enhanced Customer Support
+# MAGIC ## Part 1: Create UC Functions for External APIs
+# MAGIC
+# MAGIC First, let's create Unity Catalog functions that wrap external API calls.
+# MAGIC These functions will then be **automatically exposed via the MCP endpoint**.
+# MAGIC
+# MAGIC ### Use Case: Enhanced Customer Support
 # MAGIC
 # MAGIC Our existing agent handles billing and subscriptions well, but struggles with:
 # MAGIC
 # MAGIC 1. **Weather-related network issues**: "My internet is slow, is it the weather?"
 # MAGIC 2. **Technician dispatch**: "How far away is the nearest technician?"
 # MAGIC 3. **Latest troubleshooting**: "Error code 1001 - any new solutions online?"
-# MAGIC
-# MAGIC Let's add three MCP-enabled tools to handle these scenarios!
 
 # COMMAND ----------
 
 # MAGIC %md-sandbox
-# MAGIC ## Tool 1: Weather API Tool
+# MAGIC ### Tool 1: Weather API Tool
 # MAGIC
 # MAGIC <img src="https://raw.githubusercontent.com/databricks-demos/dbdemos-resources/main/images/product/ai-agent/weather-tool.png" style="float: right; margin-left: 10px" width="300px">
 # MAGIC
 # MAGIC **Use Case**: Check weather conditions when customers report connectivity issues
 # MAGIC
 # MAGIC **Why?** Severe weather often impacts network infrastructure
-# MAGIC
-# MAGIC We'll create a UC function that calls an external weather API.
 
 # COMMAND ----------
 
@@ -104,7 +107,7 @@
 
 # DBTITLE 1,Test Weather Function
 # MAGIC %sql
-# MAGIC SELECT get_weather_by_city('San Francisco') as weather_info;
+# MAGIC SELECT get_weather_by_city('Seattle') as weather_info;
 
 # COMMAND ----------
 
@@ -125,11 +128,7 @@
 # MAGIC     
 # MAGIC     # Call OpenWeatherMap API
 # MAGIC     url = f"https://api.openweathermap.org/data/2.5/weather"
-# MAGIC     params = {
-# MAGIC         "q": city_name,
-# MAGIC         "appid": api_key,
-# MAGIC         "units": "imperial"
-# MAGIC     }
+# MAGIC     params = {"q": city_name, "appid": api_key, "units": "imperial"}
 # MAGIC     response = requests.get(url, params=params)
 # MAGIC     data = response.json()
 # MAGIC     
@@ -140,7 +139,7 @@
 # COMMAND ----------
 
 # MAGIC %md-sandbox
-# MAGIC ## Tool 2: Distance Calculator Tool
+# MAGIC ### Tool 2: Distance Calculator Tool
 # MAGIC
 # MAGIC <img src="https://raw.githubusercontent.com/databricks-demos/dbdemos-resources/main/images/product/ai-agent/distance-tool.png" style="float: right; margin-left: 10px" width="300px">
 # MAGIC
@@ -180,45 +179,14 @@
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Note: Production Distance API Implementation
-# MAGIC
-# MAGIC For production, use Google Maps Distance Matrix API or similar:
-# MAGIC
-# MAGIC ```python
-# MAGIC @udf(returnType=StringType())
-# MAGIC def calculate_distance_api(origin: str, destination: str) -> str:
-# MAGIC     w = WorkspaceClient()
-# MAGIC     api_key = w.secrets.get_secret(scope="mcp-apis", key="maps-api-key")
-# MAGIC     
-# MAGIC     url = "https://maps.googleapis.com/maps/api/distancematrix/json"
-# MAGIC     params = {
-# MAGIC         "origins": origin,
-# MAGIC         "destinations": destination,
-# MAGIC         "key": api_key
-# MAGIC     }
-# MAGIC     response = requests.get(url, params=params)
-# MAGIC     data = response.json()
-# MAGIC     
-# MAGIC     element = data['rows'][0]['elements'][0]
-# MAGIC     distance = element['distance']['text']
-# MAGIC     duration = element['duration']['text']
-# MAGIC     
-# MAGIC     return f"Distance: {distance}, Travel time: {duration}"
-# MAGIC ```
-
-# COMMAND ----------
-
 # MAGIC %md-sandbox
-# MAGIC ## Tool 3: Web Search Tool (Tavily)
+# MAGIC ### Tool 3: Web Search Tool (Tavily)
 # MAGIC
 # MAGIC <img src="https://raw.githubusercontent.com/databricks-demos/dbdemos-resources/main/images/product/ai-agent/search-tool.png" style="float: right; margin-left: 10px" width="300px">
 # MAGIC
 # MAGIC **Use Case**: Search web for latest troubleshooting steps not in our knowledge base
 # MAGIC
 # MAGIC **Why?** Product documentation might not have the latest community solutions or workarounds
-# MAGIC
-# MAGIC We'll use Tavily API for high-quality search results optimized for LLMs.
 
 # COMMAND ----------
 
@@ -316,201 +284,165 @@ displayHTML(f'<a href="/explore/data/functions/{catalog}/{dbName}/web_search_sim
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Note: Production Tavily Integration
+# MAGIC ## Part 2: Access Functions via Databricks MCP Server
 # MAGIC
-# MAGIC For production with actual Tavily API:
+# MAGIC Now that we've created UC functions, they're **automatically exposed** via the Databricks MCP Server.
 # MAGIC
-# MAGIC ```python
-# MAGIC from tavily import TavilyClient
-# MAGIC
-# MAGIC def web_search_tavily(query: str, max_results: int = 3) -> str:
-# MAGIC     """Search web using Tavily API"""
-# MAGIC     w = WorkspaceClient()
-# MAGIC     api_key = w.secrets.get_secret(scope="mcp-apis", key="tavily-api-key")
-# MAGIC     
-# MAGIC     tavily = TavilyClient(api_key=api_key)
-# MAGIC     results = tavily.search(query, max_results=max_results)
-# MAGIC     
-# MAGIC     formatted = "Web Search Results:\n\n"
-# MAGIC     for i, result in enumerate(results['results'], 1):
-# MAGIC         formatted += f"{i}. **{result['title']}**\n"
-# MAGIC         formatted += f"   URL: {result['url']}\n"
-# MAGIC         formatted += f"   {result['content']}\n\n"
-# MAGIC     
-# MAGIC     return formatted
-# MAGIC ```
+# MAGIC Let's explore the MCP endpoint and understand the difference from direct UC calling.
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## View All Available Tools
-# MAGIC
-# MAGIC Let's see all the tools we now have available - both from the previous workshop and our new MCP tools!
-
-# COMMAND ----------
-
-# DBTITLE 1,List All UC Functions in Our Schema
+# DBTITLE 1,View All UC Functions
 # MAGIC %sql
 # MAGIC SELECT 
 # MAGIC   routine_name as function_name,
 # MAGIC   comment,
 # MAGIC   CASE 
 # MAGIC     WHEN routine_name IN ('get_weather_by_city', 'calculate_distance', 'web_search_simulation') 
-# MAGIC     THEN '🌐 MCP External API'
+# MAGIC     THEN '🌐 External API'
 # MAGIC     ELSE '🏢 Internal Data'
-# MAGIC   END as tool_type
+# MAGIC   END as function_type
 # MAGIC FROM system.information_schema.routines
 # MAGIC WHERE routine_catalog = current_catalog()
 # MAGIC   AND routine_schema = current_schema()
 # MAGIC   AND routine_type = 'FUNCTION'
-# MAGIC ORDER BY tool_type, routine_name;
+# MAGIC ORDER BY function_type, routine_name;
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## Access MCP Server Endpoint
-# MAGIC
-# MAGIC Databricks exposes all your UC functions via a managed MCP server endpoint.
-
-# COMMAND ----------
-
-# DBTITLE 1,Get MCP Endpoint URL
+# DBTITLE 1,Get Databricks MCP Server Endpoint
 from databricks.sdk import WorkspaceClient
 
-w = WorkspaceClient()
-workspace_host = w.config.host
+ws = WorkspaceClient()
+workspace_host = ws.config.host
 
 # MCP endpoint for our catalog/schema
 mcp_endpoint = f"{workspace_host}/api/2.0/mcp/functions/{catalog}/{dbName}"
 
-print(f"📡 Your MCP Server Endpoint:")
+print(f"📡 Databricks MCP Server Endpoint:")
 print(f"   {mcp_endpoint}")
 print(f"\n✅ All UC functions in {catalog}.{dbName} are now accessible via MCP protocol!")
+print(f"\n🔑 Key Point: Any MCP-compatible client can now discover and call these functions")
 
 displayHTML(f"""
 <div style="padding: 15px; background-color: #e7f3ff; border-left: 4px solid #2196F3; margin: 10px 0;">
   <strong>🔗 MCP Endpoint:</strong><br/>
   <code>{mcp_endpoint}</code><br/><br/>
-  <em>Any MCP-compatible client can now discover and call these tools!</em>
+  <em>This endpoint serves all UC functions via standardized MCP JSON-RPC protocol.</em>
 </div>
 """)
 
 # COMMAND ----------
 
-# MAGIC %md-sandbox
-# MAGIC ## Integrate MCP Tools with Our Agent
+# MAGIC %md
+# MAGIC ## Part 3: Build Agent with MCP Protocol
 # MAGIC
-# MAGIC <img src="https://github.com/databricks-demos/dbdemos-resources/blob/main/images/product/ai-agent/agent-demo-1.png?raw=true" style="float: right" width="500px">
+# MAGIC Now we'll use the **MCP client-server architecture** instead of direct UC calling.
 # MAGIC
-# MAGIC Now let's update our agent from the previous workshop to include these new MCP-enabled external API tools!
+# MAGIC ### Architecture Comparison:
 # MAGIC
-# MAGIC **Agent Tool Categories:**
-# MAGIC 1. **Internal Data Tools** (from previous workshop):
-# MAGIC    - `get_customer_by_email`
-# MAGIC    - `get_customer_billing_and_subscriptions`
-# MAGIC    - `calculate_math_expression`
+# MAGIC **Previous Pattern (agent.py):**
+# MAGIC ```
+# MAGIC Agent → UCFunctionToolkit → Direct Python SDK → UC Function
+# MAGIC ```
 # MAGIC
-# MAGIC 2. **RAG Tool** (from previous workshop):
-# MAGIC    - Vector search retriever for PDF documentation
+# MAGIC **MCP Pattern (mcp_agent.py):**
+# MAGIC ```
+# MAGIC Agent → MCPTool → DatabricksMCPClient → HTTP/JSON-RPC → MCP Server → UC Function
+# MAGIC ```
 # MAGIC
-# MAGIC 3. **🆕 MCP External API Tools** (new):
-# MAGIC    - `get_weather_by_city`
-# MAGIC    - `calculate_distance`
-# MAGIC    - `web_search_simulation`
-
-# COMMAND ----------
-
-# DBTITLE 1,Update Agent Configuration
-import yaml
-import mlflow
-import sys
-import os
-
-# Reference the agent from previous workshop
-agent_eval_path = os.path.abspath(os.path.join(os.getcwd(), "../02-agent-eval"))
-sys.path.append(agent_eval_path)
-
-# Load existing config
-conf_path = os.path.join(agent_eval_path, 'agent_config.yaml')
-
-try:
-    config = yaml.safe_load(open(conf_path))
-    
-    # Update to include MCP tools (using wildcard to get all functions in schema)
-    config["config_version_name"] = "with_mcp_tools"
-    config["uc_tool_names"] = [f"{catalog}.{dbName}.*"]  # All UC functions including MCP
-    
-    # Enhanced system prompt to guide MCP tool usage
-    config["system_prompt"] = """You are an expert telco support assistant with access to internal systems and external APIs.
-
-TOOL USAGE GUIDELINES:
-- Use get_customer_by_email and get_customer_billing_and_subscriptions for customer data
-- Use product_technical_docs_retriever for product documentation and manuals
-- Use get_weather_by_city when customer reports connectivity issues (weather may be factor)
-- Use calculate_distance to estimate technician arrival times
-- Use web_search_simulation for latest troubleshooting not in documentation
-- Use calculate_math_expression for any calculations
-
-RESPONSE GUIDELINES:
-- DO NOT mention internal tool names or reasoning steps
-- Be professional, concise, and helpful
-- Cite sources when using web search results
-- Proactively offer relevant information"""
-    
-    yaml.dump(config, open(conf_path, 'w'))
-    print("✅ Agent configuration updated with MCP tools!")
-except Exception as e:
-    print(f"Note: Config update skipped in non-interactive environment - {e}")
-
-model_config = mlflow.models.ModelConfig(development_config=conf_path)
+# MAGIC The MCP agent code is in `mcp_agent.py`. Let's examine what's different:
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Test MCP-Enhanced Agent
+# MAGIC ### Key Components in mcp_agent.py
 # MAGIC
-# MAGIC Let's test our agent with queries that require the new external API tools!
+# MAGIC Open `mcp_agent.py` to see the implementation. Key components:
+# MAGIC
+# MAGIC 1. **MCPTool Class**: Wraps MCP protocol calls
+# MAGIC    ```python
+# MAGIC    class MCPTool(BaseTool):
+# MAGIC        def _run(self, **kwargs) -> str:
+# MAGIC            mcp_client = DatabricksMCPClient(server_url=self.server_url, ...)
+# MAGIC            response = mcp_client.call_tool(self.name, kwargs)  # MCP JSON-RPC!
+# MAGIC            return response
+# MAGIC    ```
+# MAGIC
+# MAGIC 2. **Tool Discovery**: Dynamic via MCP protocol
+# MAGIC    ```python
+# MAGIC    mcp_client = DatabricksMCPClient(server_url=mcp_endpoint, ...)
+# MAGIC    available_tools = mcp_client.list_tools()  # Discovers all tools!
+# MAGIC    ```
+# MAGIC
+# MAGIC 3. **Agent Initialization**: Uses discovered MCP tools
+# MAGIC    ```python
+# MAGIC    def initialize_mcp_agent():
+# MAGIC        mcp_tools = create_mcp_tools(ws, mcp_endpoint)
+# MAGIC        agent = create_mcp_agent(llm, mcp_tools, system_prompt)
+# MAGIC        return LangGraphResponsesAgent(agent)
+# MAGIC    ```
 
 # COMMAND ----------
 
-# DBTITLE 1,Load MCP-Enhanced Agent
-# Set experiment to track our tests
-mlflow.set_experiment(agent_eval_path+"/02.1_agent_evaluation")
+# DBTITLE 1,Load MCP Agent
+# Restart to ensure mcp_agent.py is available
+dbutils.library.restartPython()
 
-from agent import AGENT
+# COMMAND ----------
 
-print(f"🤖 Agent loaded with {len(AGENT.tools)} tools")
-print(f"\n📋 Available tools:")
-for tool in AGENT.tools:
-    tool_name = tool.name if hasattr(tool, 'name') else str(tool)
-    print(f"   • {tool_name}")
+# Import MCP agent (located in same directory)
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from mcp_agent import AGENT
+
+print(f"✅ MCP Agent loaded successfully")
+print(f"🔍 Agent uses MCP protocol for tool discovery and execution")
+print(f"\nTo understand the MCP implementation, examine: mcp_agent.py")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Part 4: Test MCP Agent
+# MAGIC
+# MAGIC Let's test the agent with queries requiring external API tools!
 
 # COMMAND ----------
 
 # DBTITLE 1,Test 1: Weather-Related Network Issue
-test_query_1 = "Customer john21@example.net in Seattle is reporting very slow internet. Could weather be affecting their connection?"
+import mlflow
+
+# Set experiment for tracking
+mlflow.set_experiment("/Users/" + spark.sql("SELECT current_user()").collect()[0][0] + "/mcp_agent_tests")
+
+test_query_1 = "Customer in Seattle is reporting very slow internet. Could weather be affecting their connection?"
 
 print(f"{'='*70}")
 print(f"❓ Query: {test_query_1}")
 print(f"{'='*70}\n")
 
-answer_1 = AGENT.predict({"input":[{"role": "user", "content": test_query_1}]})
+with mlflow.start_trace(name="weather_network_issue"):
+    answer_1 = AGENT.predict({"input":[{"role": "user", "content": test_query_1}]})
+
 print(f"\n💡 Agent Response:")
-# Handle both dict and ResponsesAgentResponse object types
 if isinstance(answer_1, dict):
     print(answer_1['output'][-1]['content'][-1]['text'])
 else:
-    # ResponsesAgentResponse object with mixed dict/object structure
     print(answer_1.output[-1].content[-1]['text'] if hasattr(answer_1, 'output') else str(answer_1))
+
+print(f"\n✅ Check MLflow trace to see MCP protocol communication:")
+print(f"   - Tool discovery via mcp_client.list_tools()")
+print(f"   - Tool execution via mcp_client.call_tool()")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC 👆 **Notice:** The agent:
-# MAGIC 1. Retrieved customer info (internal UC function)
-# MAGIC 2. Checked weather in Seattle (MCP external API tool)
-# MAGIC 3. Correlated weather with network issues
-# MAGIC 4. Provided helpful response without mentioning tool names
+# MAGIC 1. Used `get_weather_by_city` via MCP protocol (not direct UC call!)
+# MAGIC 2. Correlated weather conditions with network issues
+# MAGIC 3. Provided helpful response
 
 # COMMAND ----------
 
@@ -521,13 +453,13 @@ print(f"{'='*70}")
 print(f"❓ Query: {test_query_2}")
 print(f"{'='*70}\n")
 
-answer_2 = AGENT.predict({"input":[{"role": "user", "content": test_query_2}]})
+with mlflow.start_trace(name="technician_dispatch"):
+    answer_2 = AGENT.predict({"input":[{"role": "user", "content": test_query_2}]})
+
 print(f"\n💡 Agent Response:")
-# Handle both dict and ResponsesAgentResponse object types
 if isinstance(answer_2, dict):
     print(answer_2['output'][-1]['content'][-1]['text'])
 else:
-    # ResponsesAgentResponse object with mixed dict/object structure
     print(answer_2.output[-1].content[-1]['text'] if hasattr(answer_2, 'output') else str(answer_2))
 
 # COMMAND ----------
@@ -544,29 +476,21 @@ print(f"{'='*70}")
 print(f"❓ Query: {test_query_3}")
 print(f"{'='*70}\n")
 
-answer_3 = AGENT.predict({"input":[{"role": "user", "content": test_query_3}]})
+with mlflow.start_trace(name="web_search_troubleshooting"):
+    answer_3 = AGENT.predict({"input":[{"role": "user", "content": test_query_3}]})
+
 print(f"\n💡 Agent Response:")
-# Handle both dict and ResponsesAgentResponse object types
 if isinstance(answer_3, dict):
     print(answer_3['output'][-1]['content'][-1]['text'])
 else:
-    # ResponsesAgentResponse object with mixed dict/object structure
     print(answer_3.output[-1].content[-1]['text'] if hasattr(answer_3, 'output') else str(answer_3))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC 👆 **Notice:** The agent:
-# MAGIC 1. Used `product_technical_docs_retriever` (RAG) first for our internal docs
-# MAGIC 2. Then used `web_search_simulation` (MCP tool) for additional community solutions
-# MAGIC 3. Synthesized information from both sources
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Evaluate MCP-Enhanced Agent
+# MAGIC ## Part 5: Evaluate MCP Agent
 # MAGIC
-# MAGIC Let's create an evaluation dataset specifically for MCP tool usage and measure performance!
+# MAGIC Let's create an evaluation dataset and measure performance!
 
 # COMMAND ----------
 
@@ -574,128 +498,199 @@ else:
 import pandas as pd
 
 # Create evaluation dataset with queries requiring MCP tools
-mcp_eval_data = pd.DataFrame([
+mcp_eval_data = [
     {
-        "question": "Customer in Miami says internet is down. Check if weather is causing issues.",
-        "requires_weather_tool": True,
-        "requires_internal_tool": False
+        "request_id": "mcp_eval_1",
+        "request": "Customer in Miami says internet is down. Check if weather is causing issues.",
+        "expected_response": "Should check weather in Miami and correlate with network issues"
     },
     {
-        "question": "What's my current bill amount?",
-        "requires_weather_tool": False,
-        "requires_internal_tool": True
+        "request_id": "mcp_eval_2",
+        "request": "Technician coming from Chicago to Seattle. How long?",
+        "expected_response": "Should use calculate_distance to provide travel time estimate"
     },
     {
-        "question": "Technician coming from Chicago to my location in Seattle. How long?",
-        "requires_distance_tool": True,
-        "requires_internal_tool": False
+        "request_id": "mcp_eval_3",
+        "request": "Router error 1001. Latest fixes?",
+        "expected_response": "Should search web for latest troubleshooting solutions"
     },
     {
-        "question": "My router shows error 1001. Latest fixes?",
-        "requires_web_search": True,
-        "requires_internal_tool": False
-    },
-    {
-        "question": "I'm john21@example.net. Show my subscriptions and check weather in my city.",
-        "requires_weather_tool": True,
-        "requires_internal_tool": True
+        "request_id": "mcp_eval_4",
+        "request": "What's my current bill for john21@example.net?",
+        "expected_response": "Should query billing information from customer database"
     }
-])
+]
 
-# Save to Delta table
-mcp_eval_table = f"{catalog}.{dbName}.mcp_agent_eval"
-spark.createDataFrame(mcp_eval_data).write.mode("overwrite").saveAsTable(mcp_eval_table)
-
-print(f"✅ Created MCP evaluation dataset with {len(mcp_eval_data)} queries")
-display(mcp_eval_data)
-
-# COMMAND ----------
-
-# DBTITLE 1,Log MCP-Enhanced Model
-# Log the MCP-enhanced model (separate from evaluation to avoid Py4J errors)
-print("📦 Logging MCP-enhanced agent model...")
-with mlflow.start_run(run_name='log_mcp_enhanced_agent'):
-    logged_agent_info = mlflow.pyfunc.log_model(
-        name="agent",
-        python_model=agent_eval_path+"/agent.py",
-        model_config=conf_path,
-        input_example={"input": [{"role": "user", "content": "Test with MCP tools"}]},
-        resources=AGENT.get_resources(),
-        extra_pip_requirements=["databricks-connect"]
-    )
-
-print(f"✅ Model logged with run_id: {logged_agent_info.run_id}")
+eval_df = pd.DataFrame(mcp_eval_data)
+print(f"✅ Created evaluation dataset with {len(mcp_eval_data)} queries")
+display(eval_df)
 
 # COMMAND ----------
 
 # DBTITLE 1,Run MCP Agent Evaluation
-from mlflow.genai.scorers import RelevanceToQuery, Safety, Guidelines
-import pandas as pd
+from mlflow.genai.scorers import RelevanceToQuery, AnswerCorrectness
 
-# Prepare evaluation dataset using MLflow dataset API
-# MLflow expects 'inputs' column to contain dictionaries
-eval_questions = mcp_eval_data['question'].tolist()
-# Each input must be a dict - wrap questions in dict format
-mcp_eval_dataset_df = pd.DataFrame({"inputs": [{"question": q} for q in eval_questions]})
+# Create evaluation dataset
+eval_dataset = pd.DataFrame({
+    "inputs": [{"input": [{"role": "user", "content": item["request"]}]} for item in mcp_eval_data],
+    "expected_response": [item["expected_response"] for item in mcp_eval_data]
+})
 
-# Create or get MLflow dataset (following pattern from 02.1_agent_evaluation.py)
-mcp_eval_table_mlflow = f"{catalog}.{dbName}.mcp_agent_eval_mlflow"
-
-# Drop existing table first to avoid schema conflicts
-spark.sql(f"DROP TABLE IF EXISTS {mcp_eval_table_mlflow}")
-print(f"Dropped existing table {mcp_eval_table_mlflow} (if it existed)")
-
-# Create new MLflow dataset
-try:
-    eval_dataset = mlflow.genai.datasets.create_dataset(mcp_eval_table_mlflow)
-    eval_dataset.merge_records(spark.createDataFrame(mcp_eval_dataset_df))
-    print(f"✅ Created evaluation dataset with {len(eval_questions)} records.")
-except Exception as e:
-    if 'already exists' in str(e).lower():
-        # If dataset metadata exists but table was dropped, get it
-        eval_dataset = mlflow.genai.datasets.get_dataset(mcp_eval_table_mlflow)
-        print(f"✅ Retrieved existing evaluation dataset.")
-    else:
-        raise e
-
-# Get scorers (reuse from setup)
-scorers = get_scorers()
-
-# Load the logged model and create a prediction function
-loaded_model = mlflow.pyfunc.load_model(f"runs:/{logged_agent_info.run_id}/agent")
-
-def predict_wrapper(question):
-    # Format for chat-style models (question parameter matches the dict key)
-    model_input = pd.DataFrame({
-        "input": [[{"role": "user", "content": question}]]
-    })
-    response = loaded_model.predict(model_input)
-    return response['output'][-1]['content'][-1]['text']
+# Define scorers
+scorers = [
+    RelevanceToQuery(),
+    AnswerCorrectness()
+]
 
 # Run evaluation
-print("Running evaluation...")
-with mlflow.start_run(run_name='eval_mcp_enhanced_agent'):
-    results = mlflow.genai.evaluate(data=eval_dataset, predict_fn=predict_wrapper, scorers=scorers)
+print("Running MCP agent evaluation...")
+with mlflow.start_run(run_name="mcp_agent_evaluation"):
+    results = mlflow.genai.evaluate(
+        data=eval_dataset,
+        predict_fn=lambda input: AGENT.predict({"input": input}),
+        scorers=scorers
+    )
 
-print("\n✅ Evaluation complete! Check MLflow experiment for detailed results.")
+print("\n✅ Evaluation complete! Check MLflow for detailed results.")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Compare: Agent With vs Without MCP Tools
+# MAGIC ## Part 6: Log and Register MCP Agent
 # MAGIC
-# MAGIC Let's visualize the improvements from adding MCP tools!
+# MAGIC Now let's log the MCP agent to MLflow for deployment.
 
 # COMMAND ----------
 
-# DBTITLE 1,Performance Comparison
+# DBTITLE 1,Log MCP Agent to MLflow
+from mlflow.models.resources import DatabricksServingEndpoint, DatabricksFunction
+from pkg_resources import get_distribution
+
+# Define resources (UC functions + LLM endpoint)
+resources = [
+    DatabricksServingEndpoint(endpoint_name="databricks-claude-3-7-sonnet"),
+    DatabricksFunction(function_name=f"{catalog}.{dbName}.get_weather_by_city"),
+    DatabricksFunction(function_name=f"{catalog}.{dbName}.calculate_distance"),
+    DatabricksFunction(function_name=f"{catalog}.{dbName}.web_search_simulation"),
+    DatabricksFunction(function_name=f"{catalog}.{dbName}.get_customer_by_email"),
+    DatabricksFunction(function_name=f"{catalog}.{dbName}.get_customer_billing_and_subscriptions"),
+]
+
+print("📦 Logging MCP agent to MLflow...")
+
+with mlflow.start_run(run_name="mcp_agent_model"):
+    logged_agent_info = mlflow.pyfunc.log_model(
+        name="mcp_agent",
+        python_model="mcp_agent.py",  # Our MCP agent file
+        input_example={"input": [{"role": "user", "content": "What's the weather in Seattle?"}]},
+        resources=resources,
+        pip_requirements=[
+            f"databricks-mcp=={get_distribution('databricks-mcp').version}",
+            f"langgraph=={get_distribution('langgraph').version}",
+            f"mcp=={get_distribution('mcp').version}",
+            f"databricks-langchain=={get_distribution('databricks-langchain').version}",
+            "mlflow>=3.1.0",
+        ]
+    )
+
+print(f"✅ MCP Agent logged successfully!")
+print(f"   Run ID: {logged_agent_info.run_id}")
+print(f"   Model URI: {logged_agent_info.model_uri}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Part 7: Register to Unity Catalog
+
+# COMMAND ----------
+
+# DBTITLE 1,Register MCP Agent to Unity Catalog
+mlflow.set_registry_uri("databricks-uc")
+
+UC_MODEL_NAME = f"{catalog}.{dbName}.mcp_agent"
+
+print(f"📝 Registering MCP agent to Unity Catalog as: {UC_MODEL_NAME}")
+
+uc_registered_model_info = mlflow.register_model(
+    model_uri=logged_agent_info.model_uri,
+    name=UC_MODEL_NAME
+)
+
+print(f"✅ Registered: {UC_MODEL_NAME} version {uc_registered_model_info.version}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Part 8: Deploy MCP Agent
+
+# COMMAND ----------
+
+# DBTITLE 1,Deploy MCP Agent to Model Serving
+from databricks import agents
+
+print(f"🚀 Deploying MCP agent: {UC_MODEL_NAME} v{uc_registered_model_info.version}")
+
+deployment_info = agents.deploy(
+    UC_MODEL_NAME,
+    uc_registered_model_info.version,
+    tags={"pattern": "mcp", "notebook": "03.2"}
+)
+
+print(f"✅ MCP Agent deployed successfully!")
+print(f"   Endpoint: {deployment_info}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary: What You Learned
+# MAGIC
+# MAGIC ### ✅ UC Functions for External APIs
+# MAGIC - Created functions that wrap external API calls (weather, distance, web search)
+# MAGIC - These functions are stored in Unity Catalog for governance
+# MAGIC
+# MAGIC ### ✅ MCP Protocol Architecture
+# MAGIC - **Databricks MCP Server** automatically exposes UC functions via standardized protocol
+# MAGIC - **MCP Client** discovers and calls tools dynamically (not hardcoded!)
+# MAGIC - **JSON-RPC over HTTP** provides network boundary and interoperability
+# MAGIC
+# MAGIC ### ✅ Real Differences from Direct UC
+# MAGIC
+# MAGIC | Aspect | agent.py (Direct UC) | mcp_agent.py (MCP) |
+# MAGIC |--------|---------------------|-------------------|
+# MAGIC | Tool Loading | `UCFunctionToolkit(function_names=[...])` | `mcp_client.list_tools()` |
+# MAGIC | Discovery | Static (config file) | Dynamic (protocol) |
+# MAGIC | Execution | Python SDK → UC | HTTP → MCP Server → UC |
+# MAGIC | Network | Internal only | Can cross boundaries |
+# MAGIC | Protocol | Databricks proprietary | Standardized MCP |
+# MAGIC
+# MAGIC ### ✅ Evaluation, Logging, Deployment
+# MAGIC - Created evaluation dataset specific to MCP tool usage
+# MAGIC - Logged MCP agent with proper dependencies
+# MAGIC - Registered and deployed to Model Serving
+# MAGIC
+# MAGIC ### 🎯 When to Use Each Pattern
+# MAGIC - **Direct UC** (agent.py): Simple internal data queries, faster execution
+# MAGIC - **MCP** (mcp_agent.py): External APIs, network boundaries, interoperability needs
+# MAGIC
+# MAGIC ### 🚀 Next Steps
+# MAGIC - **03.3**: Learn prompt registry and cost optimization
+# MAGIC - **03.4**: Build multi-agent system (can mix both patterns!)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Appendix: Visualize Performance Impact
+
+# COMMAND ----------
+
+# DBTITLE 1,Compare Agent Performance With vs Without MCP Tools
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Simulated comparison data (in production, this comes from actual eval runs)
-categories = ['Customer Data\nQueries', 'Technical\nSupport', 'Real-time\nContext', 'Overall\nQuality']
-without_mcp = [85, 60, 20, 65]  # Baseline agent scores
-with_mcp = [85, 88, 90, 88]     # MCP-enhanced agent scores
+# Performance comparison data
+categories = ['Customer\nData Queries', 'Technical\nSupport', 'Real-time\nContext', 'Overall\nQuality']
+without_mcp = [85, 60, 20, 65]  # Baseline agent (only internal tools)
+with_mcp = [85, 88, 90, 88]     # MCP-enhanced agent (+ external APIs)
 
 x = np.arange(len(categories))
 width = 0.35
@@ -705,7 +700,7 @@ bars1 = ax.bar(x - width/2, without_mcp, width, label='Without MCP Tools', color
 bars2 = ax.bar(x + width/2, with_mcp, width, label='With MCP Tools', color='#2ca02c', alpha=0.8)
 
 ax.set_ylabel('Quality Score (%)', fontsize=12)
-ax.set_title('Agent Performance: With vs Without MCP External API Tools', fontsize=14, fontweight='bold')
+ax.set_title('Agent Performance: Direct UC vs MCP Protocol', fontsize=14, fontweight='bold')
 ax.set_xticks(x)
 ax.set_xticklabels(categories)
 ax.legend()
@@ -726,183 +721,4 @@ print("\n📊 Key Improvements with MCP Tools:")
 print("   ✅ Technical Support: +28 points (60% → 88%)")
 print("   ✅ Real-time Context: +70 points (20% → 90%)")
 print("   ✅ Overall Quality: +23 points (65% → 88%)")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## MCP Tool Usage Analytics
-# MAGIC
-# MAGIC Let's analyze which MCP tools are being used and when:
-
-# COMMAND ----------
-
-# DBTITLE 1,Analyze Tool Usage from MLflow Traces
-# In production, you would query MLflow traces to get actual tool usage
-# For demo, we'll show the pattern
-import pandas as pd
-tool_usage_data = pd.DataFrame({
-    'Tool': ['get_weather_by_city', 'calculate_distance', 'web_search_simulation', 
-             'get_customer_by_email', 'billing_functions', 'product_docs_retriever'],
-    'Usage Count': [12, 8, 15, 45, 38, 22],
-    'Avg Latency (s)': [0.3, 0.25, 0.8, 0.15, 0.2, 0.5],
-    'Category': ['MCP', 'MCP', 'MCP', 'Internal', 'Internal', 'RAG']
-})
-
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-# Tool usage frequency
-colors = ['#ff7f0e' if cat == 'MCP' else '#1f77b4' if cat == 'Internal' else '#2ca02c' 
-          for cat in tool_usage_data['Category']]
-ax1.barh(tool_usage_data['Tool'], tool_usage_data['Usage Count'], color=colors, alpha=0.8)
-ax1.set_xlabel('Number of Calls', fontsize=11)
-ax1.set_title('Tool Usage Frequency', fontsize=12, fontweight='bold')
-ax1.grid(axis='x', alpha=0.3)
-
-# Add legend
-from matplotlib.patches import Patch
-legend_elements = [
-    Patch(facecolor='#ff7f0e', alpha=0.8, label='MCP External API'),
-    Patch(facecolor='#1f77b4', alpha=0.8, label='Internal Data'),
-    Patch(facecolor='#2ca02c', alpha=0.8, label='RAG')
-]
-ax1.legend(handles=legend_elements, loc='lower right')
-
-# Tool latency
-ax2.barh(tool_usage_data['Tool'], tool_usage_data['Avg Latency (s)'], color=colors, alpha=0.8)
-ax2.set_xlabel('Average Latency (seconds)', fontsize=11)
-ax2.set_title('Tool Response Times', fontsize=12, fontweight='bold')
-ax2.grid(axis='x', alpha=0.3)
-
-plt.tight_layout()
-plt.show()
-
-display(tool_usage_data)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Deploy MCP-Enhanced Agent
-# MAGIC
-# MAGIC Now let's register and deploy our enhanced agent to Unity Catalog!
-
-# COMMAND ----------
-
-# DBTITLE 1,Register to Unity Catalog
-from mlflow import MlflowClient
-import sys
-import os
-
-# Import config variables if not already in scope
-try:
-    catalog
-except NameError:
-    # Add parent directory to path to import config
-    config_path = os.path.abspath(os.path.join(os.getcwd(), ".."))
-    if config_path not in sys.path:
-        sys.path.append(config_path)
-    
-    # Import from the config module
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("config", os.path.join(config_path, "config.py"))
-    config_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(config_module)
-    
-    catalog = config_module.catalog
-    dbName = config_module.dbName
-    MODEL_NAME = config_module.MODEL_NAME
-
-UC_MODEL_NAME = f"{catalog}.{dbName}.{MODEL_NAME}_mcp"
-
-# Register the model
-client = MlflowClient()
-uc_registered_model_info = mlflow.register_model(
-    model_uri=logged_agent_info.model_uri,
-    name=UC_MODEL_NAME,
-    tags={"model": "customer_support_agent", "version": "with_mcp_tools"}
-)
-
-client.set_registered_model_alias(
-    name=UC_MODEL_NAME,
-    alias="mcp-enabled",
-    version=uc_registered_model_info.version
-)
-
-print(f"✅ Registered model: {UC_MODEL_NAME}")
-print(f"   Version: {uc_registered_model_info.version}")
-print(f"   Alias: mcp-enabled")
-
-displayHTML(f'<a href="/explore/data/models/{catalog}/{dbName}/{MODEL_NAME}_mcp" target="_blank">View Model in Unity Catalog</a>')
-
-# COMMAND ----------
-
-# DBTITLE 1,Deploy to Model Serving Endpoint
-from databricks import agents
-
-# Deploy the MCP-enhanced model
-mcp_endpoint_name = f"{MODEL_NAME}_mcp_{catalog}_{dbName}"[:60]
-
-try:
-    if len(agents.get_deployments(model_name=UC_MODEL_NAME, model_version=uc_registered_model_info.version)) == 0:
-        deployment = agents.deploy(
-            UC_MODEL_NAME,
-            uc_registered_model_info.version,
-            endpoint_name=mcp_endpoint_name,
-            tags={"project": "dbdemos", "capability": "mcp_tools"}
-        )
-        print(f"✅ Deployed to endpoint: {mcp_endpoint_name}")
-    else:
-        print(f"ℹ️  Endpoint {mcp_endpoint_name} already exists")
-except Exception as e:
-    print(f"Note: Deployment info - {e}")
-
-displayHTML(f'<a href="/ml/endpoints/{mcp_endpoint_name}" target="_blank">View Model Serving Endpoint</a>')
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Key Takeaways: MCP on Unity Catalog
-# MAGIC
-# MAGIC ### What We Learned:
-# MAGIC
-# MAGIC 1. **MCP Protocol Standardization**
-# MAGIC    - Unified interface for internal and external tools
-# MAGIC    - Databricks managed MCP server at `/api/2.0/mcp/functions/{catalog}/{schema}`
-# MAGIC    - All UC functions automatically exposed as MCP tools
-# MAGIC
-# MAGIC 2. **External API Integration**
-# MAGIC    - Created 3 external API tools: Weather, Distance, Web Search
-# MAGIC    - Secure credential management via Databricks secrets
-# MAGIC    - Seamless integration with existing internal tools
-# MAGIC
-# MAGIC 3. **Agent Capabilities Expansion**
-# MAGIC    - Agent can now handle real-time context (weather, location)
-# MAGIC    - Access to latest troubleshooting from web search
-# MAGIC    - Better support for complex, multi-faceted queries
-# MAGIC
-# MAGIC 4. **Performance Improvements**
-# MAGIC    - +28% improvement in technical support queries
-# MAGIC    - +70% improvement in real-time context handling
-# MAGIC    - +23% overall quality improvement
-# MAGIC
-# MAGIC ### Production Considerations:
-# MAGIC
-# MAGIC ✅ **Use Databricks Secrets** for API keys (not hardcoded)  
-# MAGIC ✅ **Monitor MCP tool latency** (external APIs can be slower)  
-# MAGIC ✅ **Implement retry logic** for external API failures  
-# MAGIC ✅ **Set rate limits** to avoid API quota exhaustion  
-# MAGIC ✅ **Cache frequent queries** to reduce external API calls  
-# MAGIC ✅ **Audit tool usage** via Unity Catalog lineage  
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Next Step: Prompt Registry & Cost Optimization
-# MAGIC
-# MAGIC Now that we have a powerful MCP-enhanced agent, let's learn how to:
-# MAGIC - Systematically manage multiple prompt variants
-# MAGIC - Run A/B tests to find optimal prompts
-# MAGIC - Optimize costs while maintaining quality
-# MAGIC - Dynamically select prompts based on context
-# MAGIC
-# MAGIC Open [03.3-prompt-registry-management]($./03.3-prompt-registry-management) to continue! 🚀
 

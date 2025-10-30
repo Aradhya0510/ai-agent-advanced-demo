@@ -58,3 +58,11 @@ mlartifacts/
 .env
 .env.local
 
+# Internal development documentation
+internal_docs/
+
+# Backup files
+*-OLD-BACKUP.*
+*-OLD.*
+*.backup
+
