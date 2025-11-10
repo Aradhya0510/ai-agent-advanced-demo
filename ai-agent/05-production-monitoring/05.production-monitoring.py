@@ -41,15 +41,15 @@
 
 # COMMAND ----------
 
-from databricks.agents.monitoring import (
-  AssessmentsSuiteConfig,
-  GuidelinesJudge,
-  create_external_monitor,
-  get_external_monitor,
-  update_external_monitor,
-  BuiltinJudge
-)
+# MLflow 3: Use scorers for production monitoring
 import mlflow
+from mlflow.genai.scorers import (
+    Safety,
+    RelevanceToQuery,
+    RetrievalGroundedness,
+    Guidelines,
+    ScorerSamplingConfig,
+)
 
 # Let's re-use an existing experiment
 xp_name = os.getcwd().rsplit("/", 1)[0]+"/03-knowledge-base-rag/03.1-pdf-rag-tool"
@@ -68,7 +68,7 @@ accuracy_guidelines = [
   """,
 ]
 
-steps_and_reasoning_guildelines = [
+steps_and_reasoning_guidelines = [
   """
   Reponse must be done without showing reasoning.
     - don't mention that you need to look up things
@@ -77,63 +77,70 @@ steps_and_reasoning_guildelines = [
   """,
 ]
 
-assessments = [
-  # Builtin judges
-  BuiltinJudge(name="safety"),
-  BuiltinJudge(name="groundedness", sample_rate=0.4),
-  BuiltinJudge(name="relevance_to_query"),
-  # Guidelines can refer to the request and response.
-  GuidelinesJudge(guidelines={
-    'accuracy': accuracy_guidelines,
-    'steps_and_reasoning': steps_and_reasoning_guildelines
-  })
-]
+# COMMAND ----------
+
+# MLflow 3: Register and start scorers for production monitoring
+# Built-in scorers (replacing BuiltinJudge)
+safety_scorer = Safety().register(name="safety")
+groundedness_scorer = RetrievalGroundedness().register(name="groundedness")
+relevance_scorer = RelevanceToQuery().register(name="relevance_to_query")
+
+# Guidelines scorers (replacing GuidelinesJudge)
+accuracy_scorer = Guidelines(
+    name="accuracy",
+    guidelines=accuracy_guidelines
+).register(name="accuracy_guidelines")
+
+reasoning_scorer = Guidelines(
+    name="steps_and_reasoning",
+    guidelines=steps_and_reasoning_guidelines
+).register(name="steps_and_reasoning_guidelines")
 
 # COMMAND ----------
 
-def get_or_create_monitor():
-  try:
-    external_monitor = get_external_monitor(experiment_name=xp_name)
-    print(f"Monitor already exists: {external_monitor}, updating it")
-
-    external_monitor = update_external_monitor(
-      experiment_name=xp_name,
-      assessments_config=AssessmentsSuiteConfig(
-          sample=1.0,  # sampling rate
-          assessments=assessments
-        ),
-    )
-    print(f"Monitor updated: {external_monitor}")
-
-  except Exception as e:
-    if "does not exist" in str(e):
-      # Create external monitor for automated production monitoring
-      external_monitor = create_external_monitor(
-        # Change to a Unity Catalog schema where you have CREATE TABLE permissions.
-        catalog_name=catalog,
-        schema_name=dbName,
-        assessments_config=AssessmentsSuiteConfig(
-          sample=1.0,  # sampling rate
-          assessments=assessments
-        )
-      )
-  print(f"Monitor created: {external_monitor}")
+def start_production_monitoring():
+  """
+  Start production monitoring by activating scorers with sampling configs.
+  Scorers will automatically evaluate traces in the experiment.
+  """
+  # Start each scorer with its sampling configuration
+  # Note: groundedness has a lower sample rate (0.4) to reduce cost
+  safety_scorer.start(sampling_config=ScorerSamplingConfig(sample_rate=1.0))
+  groundedness_scorer.start(sampling_config=ScorerSamplingConfig(sample_rate=0.4))
+  relevance_scorer.start(sampling_config=ScorerSamplingConfig(sample_rate=1.0))
+  accuracy_scorer.start(sampling_config=ScorerSamplingConfig(sample_rate=1.0))
+  reasoning_scorer.start(sampling_config=ScorerSamplingConfig(sample_rate=1.0))
+  
+  print("Production monitoring started successfully!")
+  print(f"Monitoring experiment: {xp_name}")
+  print("Active scorers:")
+  print("  - Safety (100% sample rate)")
+  print("  - Groundedness (40% sample rate)")
+  print("  - Relevance to Query (100% sample rate)")
+  print("  - Accuracy Guidelines (100% sample rate)")
+  print("  - Steps and Reasoning Guidelines (100% sample rate)")
 
 # COMMAND ----------
 
-# monitor will create a run that will be refreshed periodically (small cost incures). 
-# uncomment to create the monitor in your experiment!
-# get_or_create_monitor()
+# Scorers will automatically evaluate traces in the experiment (small cost incurs). 
+# Uncomment to start production monitoring!
+# start_production_monitoring()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC The monitoring job will take ~15 - 30 minutes to run for the first time. After the initial run, it runs every 15 minutes. Note that if you have a large volume of production traffic, the job can take additional time to complete.
+# MAGIC ## How MLflow 3 Production Monitoring Works
 # MAGIC
-# MAGIC Each time the job runs, it:
+# MAGIC Once you start the scorers, they will automatically evaluate production traces:
 # MAGIC
-# MAGIC 1. Runs each configured scorer on the sample of traces
-# MAGIC   If you have different sampling rates per scorer, the monitoring job attempts to score as many of the same traces as possible. For example, if scorer A has a 20% sampling rate and scorer B has a 40% sampling rate, the same 20% of traces will be used for A and B.
-# MAGIC 2. Attaches the feedback from the scorer to each trace in the specified MLflow Experiment
-# MAGIC 3. Writes a copy of ALL traces (not just the ones sampled) to the Delta Table named `trace_logs_<MLflow_experiment_id>`    
-# MAGIC   You can view the monitoring results using the Trace tab in the MLflow Experiment. Alternatively, you can query the traces using SQL or Spark in the generated Delta Table.
+# MAGIC 1. **Scorer Registration**: Each scorer is registered with a name in the experiment
+# MAGIC 2. **Sampling Configuration**: When started, each scorer is configured with a sample rate (e.g., 40% for groundedness to reduce cost)
+# MAGIC 3. **Automatic Evaluation**: The monitoring job runs every 15 minutes, evaluating traces based on the configured sample rates
+# MAGIC   - If you have different sampling rates per scorer, the job attempts to score the same traces when possible
+# MAGIC   - For example, if scorer A has 20% and scorer B has 40%, the same 20% of traces will be used for both
+# MAGIC 4. **Results Storage**: 
+# MAGIC   - Scorer feedback is attached to each evaluated trace in the MLflow Experiment
+# MAGIC   - All traces (not just sampled ones) are written to the Delta Table named `trace_logs_<MLflow_experiment_id>`
+# MAGIC 5. **Viewing Results**: Check the Trace tab in the MLflow Experiment UI, or query the Delta Table directly with SQL/Spark
+# MAGIC
+# MAGIC **Note**: The first monitoring run may take 15-30 minutes. Subsequent runs occur every 15 minutes. Large traffic volumes may require additional processing time.
